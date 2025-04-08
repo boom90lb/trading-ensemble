@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trading-ensemble"
-version = "0.0.2"
+version = "0.0.4"
 authors = [
     {name = "Brendon Reperttang", email = "boom90lb@mit.alum.edu"},
 ]
@@ -57,8 +57,13 @@ dev = [
 "Homepage" = "https://github.com/boom90lb/trading-ensemble"
 "Bug Tracker" = "https://github.com/boom90lb/trading-ensemble/issues"
 
+[project.scripts]
+trading-backtest = "scripts.backtest:main"
+trading-predict = "scripts.prediction:main"
+trading-train = "scripts.training:main"
+
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src", "scripts"]
 
 [tool.black]
 line-length = 119

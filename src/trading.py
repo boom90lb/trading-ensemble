@@ -321,10 +321,15 @@ class TradingStrategy:
         # Get a list of all dates across all symbols
         all_dates = pd.DatetimeIndex([])
         for symbol, df in data.items():
-            all_dates = all_dates.union(df.index)
+            # Ensure we're working with DatetimeIndex objects
+            if not isinstance(all_dates, pd.DatetimeIndex):
+                all_dates = pd.DatetimeIndex([])
+            if not isinstance(df.index, pd.DatetimeIndex):
+                continue
+            all_dates = pd.DatetimeIndex(all_dates.union(df.index))
 
-        # Ensure it's a DatetimeIndex after union
-        all_dates = pd.DatetimeIndex(all_dates).sort_values()
+        # Sort the combined dates
+        all_dates = all_dates.sort_values()
 
         # Filter by date range if specified
         if start_date:
