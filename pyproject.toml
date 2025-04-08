@@ -41,7 +41,7 @@ dependencies = [
     "pandas-stubs>=2.2.3.250308",
     "types-requests>=2.32.0.20250328",
     "types-tensorflow>=2.18.0.20250404",
-    "keras>=3.9.2",
+    "keras>=3.3.0",
 ]
 
 [project.optional-dependencies]
@@ -73,7 +73,7 @@ target-version = ["py312"]
 profile = "black"
 
 [[tool.mypy.overrides]]
-module = ["sklearn.*", "statsmodels.*"]
+module = ["sklearn.*", "statsmodels.*", "prophet.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

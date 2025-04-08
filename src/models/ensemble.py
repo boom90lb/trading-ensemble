@@ -13,6 +13,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score  #
 
 from src.config import MODELS_DIR, EnsembleConfig
 from src.models.base import BaseModel
+from src.models.lstm_ppo import LSTMPPO
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,17 @@ class EnsembleModel(BaseModel):
         self.weights: Dict[str, float] = {}  # Dictionary of {model_name: weight}
         self.errors: Dict[str, float] = {}  # Dictionary of {model_name: error_metric}
         self.is_fitted = False
+        self.lstm_ppo_save_path: Optional[Path] = None  # Store path for LSTMPPO
 
-        # Initialize model weights from config
+        # Initialize models and weights from config
         for model_config in self.config.models:
             if model_config.enabled:
-                self.weights[model_config.name] = model_config.weight
+                model_instance = self._create_model(model_config.name)
+                if model_instance:
+                    self.models[model_config.name] = model_instance
+                    self.weights[model_config.name] = model_config.weight
+                else:
+                    logger.warning(f"Failed to create model '{model_config.name}', excluding from ensemble.")
 
         # Normalize weights
         self._normalize_weights()
@@ -84,9 +91,8 @@ class EnsembleModel(BaseModel):
 
                 return XGBoostModel(target_column=self.target_column, horizon=self.horizon)
             elif model_name == "lstm_ppo":
-                # LSTM-PPO is usually imported separately due to RL dependencies
-                logger.info("LSTM-PPO model should be imported separately")
-                return None
+                # LSTM-PPO is now created directly
+                return LSTMPPO(target_column=self.target_column, horizon=self.horizon)
             else:
                 logger.warning(f"Unsupported model: {model_name}")
                 return None
@@ -98,49 +104,56 @@ class EnsembleModel(BaseModel):
             return None
 
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series, **kwargs) -> "EnsembleModel":
-        """Fit the ensemble model to training data.
+        """Fit the ensemble model by fitting each component model.
 
         Args:
             X_train: Training features
             y_train: Training targets
-            **kwargs: Additional fitting parameters for individual models
+            **kwargs: Additional arguments for specific model fit methods
+                      (e.g., lstm_ppo_timesteps, lstm_ppo_features, lstm_ppo_X_train_with_close)
 
         Returns:
-            Self for method chaining
+            Fitted ensemble model (self)
         """
-        # Initialize models if not already present
-        for model_name in list(self.weights.keys()):
-            if model_name == "lstm_ppo":
-                # Skip LSTM-PPO as it should be initialized separately
-                continue
+        fitted_models: List[str] = []
 
-            if model_name not in self.models:
-                model = self._create_model(model_name)
-                if model is not None:
-                    self.models[model_name] = model
-                else:
-                    # Remove model from weights if it couldn't be created
-                    logger.warning(f"Removing {model_name} from ensemble due to initialization failure")
-                    del self.weights[model_name]
-
-        if not self.models:
-            logger.error("No models to fit")
-            return self
-
-        # Fit each model
-        fitted_models = []
+        # Fit each enabled model
         for name, model in self.models.items():
-            # Skip LSTM-PPO as it should be fitted separately
-            if name == "lstm_ppo":
-                continue
-
             try:
                 logger.info(f"Fitting {name} model")
-                # Pass kwargs to individual model fit methods
-                model.fit(X_train, y_train, **kwargs)
+                if name == "lstm_ppo":
+                    # Special handling for LSTM-PPO
+                    lstm_ppo_timesteps = kwargs.get("lstm_ppo_timesteps", 100000)
+                    lstm_ppo_features = kwargs.get("lstm_ppo_features")
+                    lstm_ppo_X_train_with_close = kwargs.get("lstm_ppo_X_train_with_close")
+
+                    if lstm_ppo_features is None or lstm_ppo_X_train_with_close is None:
+                        logger.error(
+                            "Missing required arguments for LSTMPPO fitting: "
+                            "'lstm_ppo_features' or 'lstm_ppo_X_train_with_close'"
+                        )
+                        continue
+
+                    # Ensure model is LSTMPPO type for static analysis
+                    if isinstance(model, LSTMPPO):
+                        # Prepare data (select features, ensure close price is present)
+                        model.features = lstm_ppo_features
+                        # LSTMPPO fit method expects DataFrame with features + close price
+                        model.fit(lstm_ppo_X_train_with_close, y_train, total_timesteps=lstm_ppo_timesteps)
+                        # Save LSTM-PPO separately immediately after fitting and store its path
+                        save_path = model.save()
+                        self.lstm_ppo_save_path = save_path
+                    else:
+                        logger.error(f"Model {name} is not an instance of LSTMPPO as expected.")
+                        continue
+                else:
+                    # Standard fitting for other models
+                    # Pass only relevant kwargs if needed, or none
+                    model.fit(X_train, y_train)  # Assuming other models don't need specific kwargs from this level
+
                 fitted_models.append(name)
             except Exception as e:
-                logger.error(f"Error fitting {name} model: {e}")
+                logger.error(f"Error fitting {name} model: {e}", exc_info=True)  # Log traceback
 
         # Update weights based on fitted models
         if self.config.weighting_strategy == "dynamic":
@@ -351,20 +364,23 @@ class EnsembleModel(BaseModel):
             return pd.DataFrame()
 
     def save(self, directory: Path = MODELS_DIR) -> Path:
-        """Save the ensemble model to disk.
+        """Save the ensemble model state (config, weights, errors) to disk.
+
+        Sub-models like LSTM, XGBoost are assumed to be saved by their own methods
+        if needed, or handled separately (like LSTMPPO's path being stored).
 
         Args:
-            directory: Directory to save the model
+            directory: Base directory to save the ensemble state file.
+                     The actual file will be named within this directory.
 
         Returns:
-            Path to the saved model
+            Path to the saved *directory* containing the ensemble state.
         """
-        # Create directory if it doesn't exist
+        # Ensure the target directory exists
         directory.mkdir(exist_ok=True, parents=True)
 
-        # Create model path
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = directory / f"ensemble_h{self.horizon}_{timestamp}.pkl"
+        # Define the path for the ensemble state file within the directory
+        model_state_path = directory / f"ensemble_state_h{self.horizon}.pkl"
 
         # Create a serializable copy of the model state
         save_state: Dict[str, Any] = {
@@ -377,24 +393,28 @@ class EnsembleModel(BaseModel):
             "models": {},
         }
 
-        # Include fitted models except LSTM-PPO (save separately)
+        # Include fitted models state/path
         for name, model_instance in self.models.items():
-            if name != "lstm_ppo":
-                # Assume models have a get_params method or are pickleable
-                # If models are not directly pickleable (e.g., Keras), save their state/path
-                save_state["models"][name] = model_instance  # Or model_instance.get_state() / path
+            if name == "lstm_ppo":
+                if self.lstm_ppo_save_path:
+                    save_state["models"][name] = str(self.lstm_ppo_save_path)
+                else:
+                    logger.warning("LSTMPPO model was fitted but no save path was stored.")
+            else:
+                # Add handling for other model types if they need specific saving
+                # For now, we assume they are handled elsewhere or not saved with the ensemble state
+                # Example: save_state['models'][name] = model_instance.save(directory / name)
+                pass
 
-        # Save the state
-        with open(model_path, "wb") as f:
-            pickle.dump(save_state, f)
-
-        logger.info(f"Ensemble model state saved to {model_path}")
-
-        # Note: Individual models (like Keras, XGBoost) might need separate saving
-        # if they are not directly pickleable or if saving their state is preferred.
-        # LSTM-PPO should definitely be saved separately.
-
-        return model_path
+        # Save the state to the pickle file
+        try:
+            with open(model_state_path, "wb") as f:
+                pickle.dump(save_state, f)
+            logger.info(f"Ensemble model state saved to {model_state_path}")
+            return directory  # Return the directory path
+        except Exception as e:
+            logger.error(f"Error saving ensemble state: {e}")
+            return directory  # Still return directory even on error?
 
     def load(self, model_path: Path) -> "EnsembleModel":
         """Load model state from disk.
@@ -415,10 +435,45 @@ class EnsembleModel(BaseModel):
         self.weights = loaded_state["weights"]
         self.errors = loaded_state["errors"]
         self.is_fitted = loaded_state["is_fitted"]
-        self.models = loaded_state["models"]  # Assumes models were saved directly or state can be restored
+        self.models = {}  # Initialize empty
+        self.lstm_ppo_save_path = None  # Initialize path attribute
 
-        # Note: If models were saved separately (e.g., Keras path), load them here.
-        # Also, need to handle loading LSTM-PPO separately and adding it back.
+        # Load models
+        for name, saved_model_info in loaded_state["models"].items():
+            if name == "lstm_ppo":
+                # Load LSTMPPO from its saved path string
+                try:
+                    lstm_ppo_path_str = str(saved_model_info)
+                    lstm_ppo_path = Path(lstm_ppo_path_str)
+                    self.lstm_ppo_save_path = lstm_ppo_path  # Store the loaded path
+
+                    if lstm_ppo_path.exists() and (lstm_ppo_path / "model.zip").exists():
+                        # Re-initialize the model instance before loading
+                        lstm_ppo_model = LSTMPPO(target_column=self.target_column, horizon=self.horizon)
+                        lstm_ppo_model.load(lstm_ppo_path / "model.zip")
+                        self.models[name] = lstm_ppo_model
+                    else:
+                        logger.warning(f"LSTMPPO model path or file not found: {lstm_ppo_path}")
+                        self.is_fitted = False  # Mark as not fitted if LSTMPPO failed to load
+                except Exception as e:
+                    logger.error(f"Error loading LSTMPPO model from path {saved_model_info}: {e}")
+                    self.is_fitted = False  # Mark as not fitted if LSTMPPO failed to load
+            else:
+                # Assume other models were pickled directly
+                self.models[name] = saved_model_info
+
+        # Re-create models specified in config but not found in loaded state (optional, depends on desired behavior)
+        for model_config in self.config.models:
+            if model_config.enabled and model_config.name not in self.models:
+                logger.warning(
+                    f"Model '{model_config.name}' defined in config but not found in saved state. "
+                    f"Attempting to re-initialize."
+                )
+                model_instance = self._create_model(model_config.name)
+                if model_instance:
+                    self.models[model_config.name] = model_instance
+                    # Model will need refitting if loaded this way
+                    self.is_fitted = False  # Mark ensemble as not fully fitted if we had to re-initialize
 
         logger.info(f"Ensemble model state loaded from {model_path}")
 

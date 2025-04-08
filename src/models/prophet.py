@@ -3,6 +3,7 @@
 
 import logging
 import pickle
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -70,13 +71,62 @@ class ProphetModel(BaseModel):
             )
 
             # Add additional regressors if available in X_train
+            regressors_to_add = {}
             for feature in X_train.columns:
+                # Avoid adding base price/volume columns or target columns as regressors
                 if feature not in ["open", "high", "low", "close", "volume"] and not feature.startswith("target_"):
-                    model.add_regressor(feature)
-                    prophet_df[feature] = X_train[feature].values
+                    try:
+                        # Ensure the column exists and can be added
+                        if feature in X_train:
+                            model.add_regressor(feature)
+                            regressors_to_add[feature] = X_train[feature].values
+                        else:
+                            logger.warning(f"Regressor feature '{feature}' not found in X_train.")
+                    except Exception as e:
+                        logger.warning(f"Could not add regressor '{feature}': {e}")
+
+            # Add collected regressors to the DataFrame in one go
+            if regressors_to_add:
+                try:
+                    regressor_df = pd.DataFrame(regressors_to_add, index=prophet_df.index)
+                    prophet_df = pd.concat([prophet_df, regressor_df], axis=1)
+                except ValueError as e:
+                    logger.error(f"Error creating/concatenating regressor DataFrame: {e}")
+                    # Potentially log shapes for debugging
+                    logger.error(
+                        f"prophet_df shape: {prophet_df.shape}, regressors_to_add keys: {list(regressors_to_add.keys())}"
+                    )
+                    # Decide how to handle: raise error, return, or continue without regressors?
+                    # For now, let's log and continue without regressors in this specific error case
+                    logger.warning("Proceeding with Prophet fit without regressors due to concatenation error.")
+                except Exception as e:  # Catch other potential errors
+                    logger.error(f"Unexpected error adding regressors: {e}")
+                    # Handle appropriately
+                    self.is_fitted = False
+                    return self
 
             # Fit the model
-            model.fit(prophet_df)
+            try:
+                model.fit(prophet_df)
+            except ValueError as e:
+                # Check if the error is due to NaNs specifically
+                if "Found NaN" in str(e) or "contains NaN" in str(e):
+                    logger.error(f"Error fitting Prophet model due to NaNs: {e}")
+                    logger.error("NaNs detected in input data for Prophet. Check feature engineering steps.")
+                    # Optionally, log which columns have NaNs
+                    nan_cols = prophet_df.columns[prophet_df.isna().any()].tolist()
+                    if nan_cols:
+                        logger.error(f"Columns with NaNs: {nan_cols}")
+                else:
+                    # Handle other ValueErrors
+                    logger.error(f"ValueError fitting Prophet model: {e}")
+                self.is_fitted = False
+                return self  # Stop fitting if there's a ValueError
+            except Exception as e:  # Catch other unexpected errors during fit
+                logger.error(f"Unexpected error fitting Prophet model: {e}")
+                self.is_fitted = False
+                return self  # Stop fitting on other errors
+
             self.model = model
             self.is_fitted = True
 
@@ -108,17 +158,49 @@ class ProphetModel(BaseModel):
             # Create future dataframe for prediction
             future = pd.DataFrame({"ds": X.index})
 
-            # Add regressors if they were used during training
-            for regressor in getattr(self.model, "extra_regressors", []):
-                regressor_name = regressor["name"]
-                if regressor_name in X.columns:
-                    future[regressor_name] = X[regressor_name].values
+            # Prepare regressors if they were used during training
+            extra_regressors = getattr(self.model, "extra_regressors", [])
+            regressor_data = {}
+            if extra_regressors:
+                for regressor_name in extra_regressors:
+                    if isinstance(regressor_name, str) and regressor_name in X.columns:
+                        # Store regressor data, ensuring float type
+                        regressor_data[regressor_name] = X[regressor_name].astype(float).values
+                    else:
+                        logger.warning(f"Skipping invalid or missing regressor: {regressor_name}")
+
+                # Add all prepared regressors to the future dataframe
+                if regressor_data:
+                    try:
+                        # Create DataFrame from collected regressors
+                        regressor_df = pd.DataFrame(regressor_data, index=future.index)
+
+                        # Concatenate with the future DataFrame within a context manager to suppress warning
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", category=pd.errors.PerformanceWarning)
+                            future = pd.concat([future, regressor_df], axis=1)
+
+                    except ValueError as e:
+                        logger.error(f"Error creating/concatenating regressor DataFrame for prediction: {e}")
+                        # Log shapes for debugging
+                        logger.error(
+                            f"future shape: {future.shape}, regressor_data keys: {list(regressor_data.keys())}"
+                        )
+                        logger.warning("Proceeding with Prophet prediction without regressors due to error.")
+                        # Ensure 'future' still has the 'ds' column if concatenation fails badly
+                        if "ds" not in future.columns:
+                            logger.error("Critical error: 'ds' column lost during regressor handling.")
+                            return np.array([])  # Cannot proceed without 'ds'
+                    except Exception as e:
+                        logger.error(f"Unexpected error adding regressors during prediction: {e}")
+                        return np.array([])  # Stop prediction on unexpected error
 
             # Make predictions
             forecast = self.model.predict(future)
 
             # Return the 'yhat' column (Prophet's predictions)
-            return forecast["yhat"].values  # type: ignore
+            # Explicitly convert to numpy array to satisfy type checker
+            return np.array(forecast["yhat"].values)  # type: ignore
 
         except Exception as e:
             logger.error(f"Error predicting with Prophet model: {e}")

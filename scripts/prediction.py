@@ -72,27 +72,44 @@ def load_model(path=None, horizon=5):
     with open(path, "rb") as f:
         model = pickle.load(f)
 
-    # Check if LSTM-PPO directory exists and load it
-    lstm_ppo_dir = MODELS_DIR / f"lstm_ppo_h{horizon}"
-    lstm_ppo_path = lstm_ppo_dir / "model.zip"
+    # Ensure the loaded object is an EnsembleModel instance
+    if not isinstance(model, EnsembleModel):
+        # If loading the raw state dict from pickle
+        if isinstance(model, dict) and "target_column" in model:
+            logger.info(f"Loading ensemble state from dictionary saved at {path}")
+            horizon_loaded = model.get("horizon", horizon)  # Use loaded horizon if available
+            loaded_model = EnsembleModel(target_column=model["target_column"], horizon=horizon_loaded)
+            # Manually restore state (similar to load method)
+            loaded_model.config = model.get("config")
+            loaded_model.weights = model.get("weights", {})
+            loaded_model.errors = model.get("errors", {})
+            loaded_model.is_fitted = model.get("is_fitted", False)
+            loaded_model.models = {}  # Initialize models
 
-    if lstm_ppo_path.exists():
-        logger.info(f"Loading LSTM-PPO model from {lstm_ppo_path}")
-        try:
-            lstm_ppo = LSTMPPO(target_column="close", horizon=horizon)
-            lstm_ppo.load(lstm_ppo_path)
-
-            # Add to ensemble
-            if "lstm_ppo" not in model.models:
-                model.models["lstm_ppo"] = lstm_ppo
-                model.weights["lstm_ppo"] = 2.0  # Higher weight for RL model
-
-                # Normalize weights
-                total_weight = sum(model.weights.values())
-                for k in model.weights:
-                    model.weights[k] /= total_weight
-        except Exception as e:
-            logger.error(f"Error loading LSTM-PPO model: {e}")
+            # Load models from the state dict
+            loaded_model_states = model.get("models", {})
+            for name, saved_model_info in loaded_model_states.items():
+                if name == "lstm_ppo":
+                    try:
+                        lstm_ppo_path = Path(str(saved_model_info))
+                        if lstm_ppo_path.exists() and (lstm_ppo_path / "model.zip").exists():
+                            lstm_ppo = LSTMPPO(target_column=loaded_model.target_column, horizon=loaded_model.horizon)
+                            lstm_ppo.load(lstm_ppo_path / "model.zip")
+                            loaded_model.models[name] = lstm_ppo
+                            loaded_model.lstm_ppo_save_path = lstm_ppo_path  # Store path
+                        else:
+                            logger.warning(f"LSTMPPO path/file not found during dict load: {lstm_ppo_path}")
+                            loaded_model.is_fitted = False
+                    except Exception as e:
+                        logger.error(f"Error loading LSTMPPO from dict state: {e}")
+                        loaded_model.is_fitted = False
+                else:
+                    # Assume other models are pickleable instances
+                    loaded_model.models[name] = saved_model_info
+            model = loaded_model  # Replace the dict with the constructed instance
+        else:
+            logger.error(f"Loaded object from {path} is not an EnsembleModel or a recognized state dictionary.")
+            raise TypeError(f"Expected EnsembleModel or state dict, got {type(model)}")
 
     return model
 

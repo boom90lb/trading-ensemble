@@ -4,8 +4,35 @@
 import argparse
 import json
 import logging
+import os
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+import pandas as pd  # Import pandas to access the error type
+
+# Suppress specific Pandas warnings (like DataFrame fragmentation)
+try:
+    warnings.simplefilter(action="ignore", category=pd.errors.PerformanceWarning)
+except AttributeError:
+    # Older pandas versions might not have this specific error type exposed
+    # You might need a more general filter or upgrade pandas if this is critical
+    warnings.warn("Could not specifically filter PerformanceWarning. Filtering FutureWarning instead.", FutureWarning)
+    warnings.simplefilter(action="ignore", category=FutureWarning)
+
+# Configure TF log level *before* importing tensorflow
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # ERROR level
+import tensorflow as tf
+
+tf.get_logger().setLevel("ERROR")
+
+# Configure base logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Silence Prophet logs
+logging.getLogger("prophet").setLevel(logging.WARNING)
+logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 
 import pandas as pd
 
@@ -13,12 +40,7 @@ from src.config import DEFAULT_TRAINING_CONFIG, EnsembleConfig, ModelConfig, Tra
 from src.data_loader import DataLoader
 from src.features import FeatureEngineer
 from src.models.ensemble import EnsembleModel
-from src.models.lstm_ppo import LSTMPPO
 from src.sentiment_analysis import SentimentAnalyzer
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -63,9 +85,18 @@ def parse_args():
 def main():
     """Main function."""
     args = parse_args()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Parse symbols
     symbols = args.symbols.split(",")
+    symbols_str = "_".join(symbols)  # Create a string representation for the directory name
+
+    # --- Create unique output directory for this run ---
+    run_name = f"run_{symbols_str}_{timestamp}"
+    output_dir = Path("runs") / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Saving run artifacts to: {output_dir.resolve()}")
+    # ---
 
     # Create training config
     training_config = TrainingConfig(
@@ -159,6 +190,7 @@ def main():
     ensemble = EnsembleModel(target_column="close", horizon=training_config.prediction_horizon, config=ensemble_config)
 
     # Train for each symbol
+    all_run_metrics = {}  # Store metrics for all symbols in this run
     for symbol, data_dict in enhanced_data.items():
         logger.info(f"Training ensemble for {symbol}")
 
@@ -179,36 +211,21 @@ def main():
         X_test = test_df.drop(columns=[col for col in test_df.columns if "target_" in col or "direction_" in col])
         y_test = test_df[target_col]
 
-        # Special handling for LSTM-PPO model
-        if "lstm_ppo" in model_names:
-            logger.info(f"Training LSTM-PPO for {symbol}")
-            lstm_ppo = LSTMPPO(
-                target_column="close",
-                horizon=training_config.prediction_horizon,
-                features=[
-                    col for col in X_train.columns if not (col.startswith("target_") or col.startswith("direction_"))
-                ],
-                window_size=20,  # Adjust window size as needed
-            )
-
-            # For LSTM-PPO, we need to include the close price in X_train
-            lstm_ppo_train = X_train.copy()
-            lstm_ppo_train["close"] = train_df["close"] if "close" in train_df else y_train
-
-            # Train LSTM-PPO model
-            lstm_ppo.fit(lstm_ppo_train, y_train, total_timesteps=args.rl_timesteps)
-
-            # Save LSTM-PPO model separately
-            lstm_ppo.save()
-
-            # Add to ensemble manually
-            ensemble.models["lstm_ppo"] = lstm_ppo
-            ensemble.is_fitted = True
-
-        # Train the remaining ensemble models
-        logger.info(f"Training remaining ensemble models for {symbol}")
+        # Train the ensemble models
+        logger.info(f"Training ensemble models for {symbol}")
         try:
-            ensemble.fit(X_train, y_train)
+            # Pass rl_timesteps for LSTMPPO if it's in the models
+            fit_kwargs = {}
+            if "lstm_ppo" in model_names:
+                fit_kwargs["lstm_ppo_timesteps"] = args.rl_timesteps
+                # Pass required features for LSTMPPO
+                fit_kwargs["lstm_ppo_features"] = [
+                    col for col in X_train.columns if not (col.startswith("target_") or col.startswith("direction_"))
+                ]
+                # Pass original close price needed for LSTMPPO fitting/environment
+                fit_kwargs["lstm_ppo_X_train_with_close"] = train_df  # Pass the unscaled df
+
+            ensemble.fit(X_train, y_train, **fit_kwargs)
         except Exception as e:
             logger.error(f"Error training ensemble for {symbol}: {e}")
             continue
@@ -216,6 +233,7 @@ def main():
         # Evaluate on test data
         logger.info(f"Evaluating ensemble for {symbol}")
         metrics = ensemble.evaluate(X_test, y_test)
+        all_run_metrics[symbol] = metrics  # Store metrics for this symbol
 
         logger.info(f"Test metrics for {symbol}: {metrics}")
 
@@ -223,26 +241,36 @@ def main():
         contributions = ensemble.get_model_contributions(X_test.iloc[:5])
         logger.info(f"Model contributions for {symbol}:\n{contributions}")
 
-        # Save results
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_path = Path(f"results/training_{symbol}_{timestamp}.json")
-        results_path.parent.mkdir(exist_ok=True, parents=True)
-
-        with open(results_path, "w") as f:
+        # --- Save individual symbol results to the run directory ---
+        symbol_results_path = output_dir / f"results_{symbol}.json"
+        # No need to create parent dir, output_dir already exists
+        with open(symbol_results_path, "w") as f:
             json.dump(
                 {
                     "symbol": symbol,
                     "metrics": metrics,
                     "weights": {k: float(v) for k, v in ensemble.weights.items()},
-                    "timestamp": timestamp,
+                    "timestamp": timestamp,  # Keep original run timestamp
                 },
                 f,
                 indent=2,
             )
+        logger.info(f"Saved evaluation results for {symbol} to {symbol_results_path}")
+        # ---
 
-    # Save the final ensemble model
-    logger.info("Saving ensemble model")
-    ensemble.save()
+    # --- Save the final ensemble model to the run directory ---
+    logger.info("Saving ensemble model state")
+    ensemble_save_path = output_dir / "ensemble_model"  # Pass a sub-directory
+    ensemble.save(directory=ensemble_save_path)  # Pass the dedicated directory
+    logger.info(f"Ensemble model state saved to {ensemble_save_path}")
+    # ---
+
+    # --- Optionally, save aggregated metrics for the whole run ---
+    aggregated_results_path = output_dir / "aggregated_results.json"
+    with open(aggregated_results_path, "w") as f:
+        json.dump(all_run_metrics, f, indent=2)
+    logger.info(f"Saved aggregated evaluation results to {aggregated_results_path}")
+    # ---
 
     logger.info("Training complete")
 
