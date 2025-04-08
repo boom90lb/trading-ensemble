@@ -461,9 +461,11 @@ class LSTMPPO(BaseModel):
             self.env = self._create_environment(train_df)
 
             # Create the LSTM-PPO model
-            self.model = PPO(  # type: ignore
-                policy=LSTMPolicy,
-                env=self.env,
+            self.model = PPO(
+                LSTMPolicy,
+                self.env,
+                verbose=0,
+                device=self.device,
                 learning_rate=self.learning_rate,
                 n_steps=self.n_steps,
                 batch_size=self.batch_size,
@@ -471,16 +473,16 @@ class LSTMPPO(BaseModel):
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
                 clip_range=self.clip_range,
-                seed=self.seed,
-                device=self.device,
-                verbose=1,
+                ent_coef=0.01,
+                vf_coef=0.5,
+                max_grad_norm=0.5,
             )
 
-            # Get training iterations from kwargs or use default
+            # Optionally get total_timesteps from kwargs
             total_timesteps = kwargs.get("total_timesteps", 100000)
 
-            # Train the model
-            self.model.learn(total_timesteps=total_timesteps, progress_bar=True)
+            # Train the model without progress bar
+            self.model.learn(total_timesteps=total_timesteps)
 
             self.is_fitted = True
             logger.info("LSTM-PPO model trained")

@@ -139,8 +139,12 @@ class LSTMModel(BaseModel):
             # Build the model
             self.model = self._build_model((self.sequence_length, X.shape[2]))
 
+            # Log the shape of the input sequences before fitting
+            logger.info(f"Shape of sequences being passed to LSTM fit: {X.shape}")
+            logger.info(f"Shape of targets being passed to LSTM fit: {y.shape}")
+
             # Set up early stopping
-            early_stopping = EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
+            early_stopping = EarlyStopping(monitor="val_loss", patience=25, restore_best_weights=True)
 
             # Train the model
             self.model.fit(  # type: ignore
@@ -155,10 +159,11 @@ class LSTMModel(BaseModel):
             )
 
             self.is_fitted = True
-            logger.info("LSTM model fitted")
+            logger.info("LSTM model fitted successfully")
 
         except Exception as e:
-            logger.error(f"Error fitting LSTM model: {e}")
+            # Log the full traceback for detailed debugging
+            logger.error(f"Error fitting LSTM model: {e}", exc_info=True)
             self.is_fitted = False
 
         return self
