@@ -31,8 +31,8 @@ A sophisticated trading system that combines classical time series forecasting m
 │   │   ├── lstm_ppo.py       # LSTM-PPO reinforcement learning model
 │   │   └── ensemble.py       # Ensemble model combining others
 ├── scripts/
-│   ├── train.py              # Script to train models
-│   ├── predict.py            # Script to make predictions
+│   ├── training.py              # Script to train models
+│   ├── prediction.py            # Script to make predictions
 │   └── backtest.py           # Script to backtest the model
 ├── data/                     # Directory for stored data
 ├── models/                   # Directory for saved models
@@ -43,7 +43,7 @@ A sophisticated trading system that combines classical time series forecasting m
 
 ## Installation
 
-This project requires Python 3.13 or higher.
+This project requires Python 3.12 or higher.
 
 ```bash
 # Clone the repository
@@ -57,6 +57,9 @@ source venv/bin/activate  # On Windows, use: venv\Scripts\activate
 # Install using uv for faster dependency resolution
 pip install uv
 uv pip install -e .
+
+# Install the latest versions of CUDA and cuDNN
+[NVIDIA cuDNN Installation Guide](https://docs.nvidia.com/deeplearning/cudnn/archives/cudnn-890/install-guide/index.html)
 ```
 
 ## Configuration
@@ -74,10 +77,10 @@ POLYGON_API_KEY=your_polygon_api_key_here
 
 ```bash
 # Train the ensemble model with default settings
-python -m scripts.train --symbols AAPL,MSFT,GOOG --timeframe 1d --start_date 2020-01-01
+python -m scripts.train --symbols AAPL,MSFT,GOOG --timeframe 1day --start_date 2020-01-01
 
 # Train with sentiment analysis
-python -m scripts.train --symbols AAPL --timeframe 1d --start_date 2020-01-01 --use_sentiment
+python -m scripts.train --symbols AAPL --timeframe 1day --start_date 2020-01-01 --use_sentiment
 
 # Train with specified models and RL timesteps
 python -m scripts.train --symbols AAPL --models arima,lstm,lstm_ppo --rl_timesteps 200000
@@ -87,7 +90,7 @@ python -m scripts.train --symbols AAPL --models arima,lstm,lstm_ppo --rl_timeste
 
 ```bash
 # Make predictions for a symbol
-python -m scripts.predict --symbols AAPL --timeframe 1d --horizon 5
+python -m scripts.predict --symbols AAPL --timeframe 1day --horizon 5
 
 # Make predictions with sentiment analysis and plot results
 python -m scripts.predict --symbols AAPL --use_sentiment --plot
