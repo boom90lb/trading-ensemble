@@ -2,7 +2,7 @@
 """Trading strategy and backtesting module."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
 
@@ -267,7 +267,7 @@ class TradingStrategy:
         Returns:
             Updated portfolio value
         """
-        position_value = 0
+        position_value = 0.0  # Initialize as float
 
         # Calculate value of open positions
         for symbol, position_info in self.positions.items():
@@ -323,7 +323,8 @@ class TradingStrategy:
         for symbol, df in data.items():
             all_dates = all_dates.union(df.index)
 
-        all_dates = all_dates.sort_values()
+        # Ensure it's a DatetimeIndex after union
+        all_dates = pd.DatetimeIndex(all_dates).sort_values()
 
         # Filter by date range if specified
         if start_date:
@@ -354,7 +355,8 @@ class TradingStrategy:
             current_prices = {}
             for symbol, df in data.items():
                 if date in df.index:
-                    current_prices[symbol] = df.loc[date, "close"]
+                    # Ensure price is float, ignore type checker uncertainty
+                    current_prices[symbol] = float(df.loc[date, "close"])  # type: ignore
 
             # Skip if no prices available
             if not current_prices:
@@ -376,7 +378,8 @@ class TradingStrategy:
                 # Add sentiment features if available
                 symbol_sentiment = None
                 if use_sentiment and symbol in sentiment_data:
-                    symbol_sentiment = sentiment_data[symbol].loc[[date]].copy()
+                    # Use slice indexing for .loc to ensure DataFrame return type
+                    symbol_sentiment = sentiment_data[symbol].loc[date:date].copy()
 
                 # Generate prediction
                 try:

@@ -6,7 +6,7 @@ from typing import Dict, List, Union
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler  # type: ignore
 
 logger = logging.getLogger(__name__)
 

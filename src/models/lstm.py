@@ -4,7 +4,7 @@
 import logging
 import pickle
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -32,7 +32,7 @@ class LSTMModel(BaseModel):
         learning_rate: float = 0.001,
         epochs: int = 100,
         batch_size: int = 32,
-        **kwargs,
+        **kwargs: Dict[str, Any],
     ):
         """Initialize the LSTM model.
 
