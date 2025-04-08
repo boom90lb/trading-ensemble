@@ -57,10 +57,10 @@ source venv/bin/activate  # On Windows, use: venv\Scripts\activate
 # Install using uv for faster dependency resolution
 pip install uv
 uv pip install -e .
-
-# Install the latest versions of CUDA and cuDNN
-[NVIDIA cuDNN Installation Guide](https://docs.nvidia.com/deeplearning/cudnn/archives/cudnn-890/install-guide/index.html)
 ```
+
+## Install the latest versions of CUDA and cuDNN
+[NVIDIA cuDNN Installation Guide](https://docs.nvidia.com/deeplearning/cudnn/archives/cudnn-890/install-guide/index.html)
 
 ## Configuration
 
