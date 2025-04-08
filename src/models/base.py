@@ -90,7 +90,7 @@ class BaseModel(ABC):
         Returns:
             Dictionary of evaluation metrics
         """
-        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score  # type: ignore
 
         # Get predictions
         y_pred = self.predict(X_test)

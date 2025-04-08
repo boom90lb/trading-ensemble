@@ -8,8 +8,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.arima.model import ARIMA  # type: ignore
+from statsmodels.tsa.statespace.sarimax import SARIMAX  # type: ignore
 
 from src.config import MODELS_DIR
 from src.models.base import BaseModel
