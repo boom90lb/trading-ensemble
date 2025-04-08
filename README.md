@@ -47,8 +47,8 @@ This project requires Python 3.13 or higher.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/ts-ensemble-trader.git
-cd ts-ensemble-trader
+git clone https://github.com/yourusername/trading-ensemble.git
+cd trading-ensemble
 
 # Create and activate a virtual environment
 python -m venv venv
