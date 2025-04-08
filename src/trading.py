@@ -4,7 +4,7 @@
 import logging
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,6 +25,13 @@ class Position(Enum):
     LONG = 1
     SHORT = -1
     FLAT = 0
+
+
+# Define a TypedDict for clearer position information structure
+class PositionInfo(TypedDict):
+    position: Position
+    entry_price: float
+    size: float
 
 
 class TradingStrategy:
@@ -49,11 +56,11 @@ class TradingStrategy:
         self.config = config
         self.sentiment_analyzer = sentiment_analyzer
         self.use_sentiment = use_sentiment and sentiment_analyzer is not None
-        self.positions = {}  # Current positions: {symbol: {"position": Position, "entry_price": float, "size": float}}
+        self.positions: Dict[str, PositionInfo] = {}
         self.cash = config.initial_capital
         self.portfolio_value = config.initial_capital
-        self.history = []  # Trading history
-        self.transaction_log = []  # Transaction log
+        self.history: List[Dict[str, Union[pd.Timestamp, float]]] = []
+        self.transaction_log: List[Dict[str, Any]] = []
 
     def calculate_signal(
         self,
@@ -184,12 +191,12 @@ class TradingStrategy:
 
             # Calculate profit/loss (accounting for short positions)
             if old_position_type == Position.LONG:
-                pnl = (price - old_entry_price) * old_size
+                pnl = (price - old_entry_price) * old_size  # type: ignore
             else:  # SHORT
-                pnl = (old_entry_price - price) * old_size
+                pnl = (old_entry_price - price) * old_size  # type: ignore
 
             # Deduct commission
-            commission = price * old_size * self.config.commission
+            commission = price * old_size * self.config.commission  # type: ignore
             net_pnl = pnl - commission
 
             # Update cash
@@ -270,16 +277,16 @@ class TradingStrategy:
                 entry_price = position_info["entry_price"]
 
                 if position_info["position"] == Position.LONG:
-                    value = size * current_price
+                    value = size * current_price  # type: ignore
                 else:  # SHORT
-                    value = size * (2 * entry_price - current_price)
+                    value = size * (2 * entry_price - current_price)  # type: ignore
 
                 position_value += value
 
         # Update portfolio value
         self.portfolio_value = self.cash + position_value
 
-        return self.portfolio_value
+        return float(self.portfolio_value)
 
     def backtest(
         self,

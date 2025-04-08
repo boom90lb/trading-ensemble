@@ -118,8 +118,12 @@ def main():
         # Add sentiment features if requested
         if args.use_sentiment and sentiment_analyzer:
             logger.info(f"Creating sentiment features for {symbol}")
-            train_sentiment = sentiment_analyzer.create_sentiment_features(symbol, train_with_features.index)
-            test_sentiment = sentiment_analyzer.create_sentiment_features(symbol, test_with_features.index)
+            train_sentiment = sentiment_analyzer.create_sentiment_features(
+                symbol, pd.DatetimeIndex(train_with_features.index)  # type: ignore
+            )
+            test_sentiment = sentiment_analyzer.create_sentiment_features(
+                symbol, pd.DatetimeIndex(test_with_features.index)  # type: ignore
+            )
 
             # Join sentiment features
             if not train_sentiment.empty:
