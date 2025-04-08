@@ -8,10 +8,10 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 import pandas as pd
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping  # type: ignore
+from tensorflow.keras.layers import LSTM, Dense, Dropout  # type: ignore
+from tensorflow.keras.models import Sequential, load_model  # type: ignore
+from tensorflow.keras.optimizers import Adam  # type: ignore
 
 from src.config import MODELS_DIR
 from src.models.base import BaseModel
