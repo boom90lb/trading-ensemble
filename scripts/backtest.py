@@ -5,13 +5,11 @@ import argparse
 import json
 import logging
 import pickle
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-import seaborn as sns
 
 from src.config import MODELS_DIR, RESULTS_DIR, TradingConfig
 from src.data_loader import DataLoader
@@ -194,7 +192,9 @@ def run_backtest(args):
         # Add sentiment features if requested
         if args.use_sentiment and sentiment_analyzer:
             logger.info(f"Creating sentiment features for {symbol}")
-            sentiment_features = sentiment_analyzer.create_sentiment_features(symbol, df_with_features.index)
+            sentiment_features = sentiment_analyzer.create_sentiment_features(
+                symbol, pd.DatetimeIndex(df_with_features.index)  # type: ignore
+            )
 
             if not sentiment_features.empty:
                 df_with_features = df_with_features.join(sentiment_features)

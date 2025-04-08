@@ -2,7 +2,6 @@
 """Script for making predictions with the time series ensemble model."""
 
 import argparse
-import json
 import logging
 import pickle
 from datetime import datetime, timedelta
@@ -151,7 +150,9 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
         # Add sentiment features if requested
         if use_sentiment and sentiment_analyzer:
             logger.info(f"Creating sentiment features for {symbol}")
-            sentiment_features = sentiment_analyzer.create_sentiment_features(symbol, df_with_features.index)
+            sentiment_features = sentiment_analyzer.create_sentiment_features(
+                symbol, pd.DatetimeIndex(df_with_features.index)  # type: ignore
+            )
 
             if not sentiment_features.empty:
                 df_with_features = df_with_features.join(sentiment_features)

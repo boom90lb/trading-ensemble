@@ -38,6 +38,10 @@ dependencies = [
     "tqdm>=4.64.0",
     "python-dotenv>=1.0.0",
     "requests>=2.30.0",
+    "pandas-stubs>=2.2.3.250308",
+    "types-requests>=2.32.0.20250328",
+    "types-tensorflow>=2.18.0.20250404",
+    "keras>=3.9.2",
 ]
 
 [project.optional-dependencies]
@@ -62,6 +66,10 @@ target-version = ["py312"]
 
 [tool.isort]
 profile = "black"
+
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "statsmodels.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -2,21 +2,19 @@
 """LSTM-PPO model implementation for reinforcement learning trading."""
 
 import logging
-import os
+import pickle
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from torch.distributions import Normal
 
 from src.config import MODELS_DIR
 from src.models.base import BaseModel
@@ -28,7 +26,11 @@ class LSTMFeatureExtractor(BaseFeaturesExtractor):
     """LSTM feature extractor for processing sequential market data."""
 
     def __init__(
-        self, observation_space: spaces.Box, features_dim: int = 64, lstm_hidden_size: int = 128, lstm_layers: int = 1
+        self,
+        observation_space: spaces.Box,
+        features_dim: int = 64,
+        lstm_hidden_size: int = 128,
+        lstm_layers: int = 1,
     ):
         """Initialize the LSTM feature extractor.
 
@@ -84,7 +86,12 @@ class LSTMPolicy(ActorCriticPolicy):
     """Custom policy that uses an LSTM feature extractor."""
 
     def __init__(
-        self, observation_space: spaces.Space, action_space: spaces.Space, lr_schedule: callable, *args, **kwargs
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Callable[[float], float],
+        *args,
+        **kwargs,
     ):
         """Initialize the LSTM policy.
 
@@ -141,13 +148,13 @@ class TradingEnvironment(gym.Env):
             if feature not in df.columns:
                 raise ValueError(f"Feature {feature} not in DataFrame")
 
-        # Environment state
-        self.current_step = None
-        self.current_position = None
-        self.current_balance = None
-        self.entry_price = None
-        self.entry_step = None
-        self.done = None
+        # Environment state - initialized in reset
+        self.current_step: Optional[int] = None
+        self.current_position: Optional[float] = None
+        self.current_balance: Optional[float] = None
+        self.entry_price: Optional[float] = None
+        self.entry_step: Optional[int] = None
+        self.done: Optional[bool] = None
 
         # Action and observation spaces
         # Action space: [position_size] from -1.0 (full short) to 1.0 (full long)
@@ -159,8 +166,8 @@ class TradingEnvironment(gym.Env):
             low=-np.inf, high=np.inf, shape=(window_size, num_features), dtype=np.float32
         )
 
-        # Initialize
-        self.reset()
+        # Initialize - call reset to properly set initial state
+        # self.reset() # Reset is typically called externally before starting training/evaluation
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, Dict]:
         """Reset the environment to start a new episode.
@@ -176,15 +183,18 @@ class TradingEnvironment(gym.Env):
 
         # Set the starting point of the episode
         if options and "start_idx" in options:
-            self.current_step = options["start_idx"]
+            start_idx = options["start_idx"]
         else:
             # Start after window_size to have enough history
-            self.current_step = self.window_size
+            start_idx = self.window_size
+
+        # Ensure start_idx is valid
+        self.current_step = max(self.window_size, min(start_idx, len(self.df) - 1))
 
         # Reset state
-        self.current_position = 0  # No position
+        self.current_position = 0.0  # No position
         self.current_balance = self.initial_balance
-        self.entry_price = 0
+        self.entry_price = 0.0
         self.entry_step = 0
         self.done = False
 
@@ -204,7 +214,15 @@ class TradingEnvironment(gym.Env):
             Tuple of (observation, reward, terminated, truncated, info)
         """
         if self.done:
-            raise RuntimeError("Episode already done, call reset() first")
+            # Return last state if already done
+            logger.warning("Called step() on a done environment. Returning last observation.")
+            observation = self._get_observation()
+            info = self._get_info()
+            return observation, 0.0, True, False, info
+
+        # Ensure current_step is valid
+        if self.current_step is None or self.current_step >= len(self.df):
+            raise RuntimeError("Invalid environment state: current_step is invalid or out of bounds.")
 
         # Extract action (position size)
         position_size = float(action[0])  # Range: -1.0 to 1.0
@@ -226,9 +244,11 @@ class TradingEnvironment(gym.Env):
         truncated = False
 
         # Episode ends when we reach the end of data
-        if self.current_step >= len(self.df) - 1:
+        if self.current_step >= len(self.df):
             terminated = True
             self.done = True
+            # Adjust step back to last valid index for final observation/info
+            self.current_step = len(self.df) - 1
 
         # Get new observation
         observation = self._get_observation()
@@ -242,17 +262,24 @@ class TradingEnvironment(gym.Env):
         Returns:
             Observation as numpy array
         """
+        if self.current_step is None:
+            # Should not happen if reset is called first
+            return np.zeros((self.window_size, len(self.features)), dtype=np.float32)
+
         # Extract window of features
-        start_idx = self.current_step - self.window_size + 1
+        start_idx = max(0, self.current_step - self.window_size + 1)
         end_idx = self.current_step + 1
 
         # Get feature data
         observations = self.df.iloc[start_idx:end_idx][self.features].values
 
-        # Ensure the shape is correct
+        # Ensure the shape is correct by padding if needed
         if observations.shape[0] < self.window_size:
             padding = np.zeros((self.window_size - observations.shape[0], len(self.features)))
             observations = np.concatenate([padding, observations])
+        elif observations.shape[0] > self.window_size:
+            # This case might happen if current_step was adjusted after termination
+            observations = observations[-self.window_size :]
 
         return observations.astype(np.float32)
 
@@ -262,11 +289,16 @@ class TradingEnvironment(gym.Env):
         Returns:
             Dictionary with additional information
         """
+        if self.current_step is None or self.current_step >= len(self.df):
+            price = 0  # Or handle appropriately
+        else:
+            price = self.df.iloc[self.current_step]["close"]
+
         return {
             "balance": self.current_balance,
             "position": self.current_position,
             "step": self.current_step,
-            "price": self.df.iloc[self.current_step]["close"] if self.current_step < len(self.df) else 0,
+            "price": price,
         }
 
     def _calculate_reward(self, new_position: float, current_price: float) -> float:
@@ -279,7 +311,8 @@ class TradingEnvironment(gym.Env):
         Returns:
             Reward value
         """
-        prev_position = self.current_position
+        prev_position = self.current_position if self.current_position is not None else 0.0
+        entry_price = self.entry_price if self.entry_price is not None else 0.0
 
         # If this is the first step or position hasn't changed, no immediate reward
         if prev_position == new_position:
@@ -290,18 +323,23 @@ class TradingEnvironment(gym.Env):
             transaction_cost = position_change * current_price * self.transaction_cost
 
             # Update balance based on transaction cost
-            self.current_balance -= transaction_cost
+            if self.current_balance is not None:
+                self.current_balance -= transaction_cost
+            else:
+                self.current_balance = self.initial_balance - transaction_cost
 
             # If closing a position, calculate profit/loss
             if (prev_position > 0 and new_position <= 0) or (prev_position < 0 and new_position >= 0):
                 # Calculate profit/loss
                 if prev_position > 0:  # Long position
-                    pnl = prev_position * (current_price - self.entry_price)
+                    pnl = prev_position * (current_price - entry_price)
                 else:  # Short position
-                    pnl = -prev_position * (self.entry_price - current_price)
+                    pnl = -prev_position * (entry_price - current_price)
 
                 # Update balance
-                self.current_balance += pnl
+                if self.current_balance is not None:
+                    self.current_balance += pnl
+                # else: handle error or initialization state
 
                 # Reward is the PnL minus transaction cost
                 reward = pnl - transaction_cost
@@ -380,8 +418,8 @@ class LSTMPPO(BaseModel):
         self.device = device
 
         # RL environment and model
-        self.env = None
-        self.model = None
+        self.env: Optional[TradingEnvironment] = None
+        self.model: Optional[PPO] = None
 
     def _create_environment(self, df: pd.DataFrame) -> TradingEnvironment:
         """Create a trading environment.
@@ -406,7 +444,7 @@ class LSTMPPO(BaseModel):
         Args:
             X_train: Training features
             y_train: Training targets
-            **kwargs: Additional fitting parameters
+            **kwargs: Additional fitting parameters (e.g., total_timesteps)
 
         Returns:
             Self for method chaining
@@ -423,7 +461,7 @@ class LSTMPPO(BaseModel):
             self.env = self._create_environment(train_df)
 
             # Create the LSTM-PPO model
-            self.model = PPO(
+            self.model = PPO(  # type: ignore
                 policy=LSTMPolicy,
                 env=self.env,
                 learning_rate=self.learning_rate,
@@ -481,19 +519,36 @@ class LSTMPPO(BaseModel):
 
             # Generate predictions for each step
             predictions = []
+            current_obs = obs
 
-            for i in range(len(test_df)):
+            for _ in range(len(test_df)):
+                # Ensure current_obs is correctly shaped for predict
+                if len(current_obs.shape) == 2:
+                    # Reshape [seq_len, features] to [1, seq_len, features]
+                    current_obs = np.expand_dims(current_obs, axis=0)
+                elif len(current_obs.shape) != 3 or current_obs.shape[0] != 1:
+                    logger.error(f"Invalid observation shape for prediction: {current_obs.shape}")
+                    return np.array([])  # Or handle error appropriately
+
                 # Get action from model
-                action, _ = self.model.predict(obs, deterministic=True)
+                action, _ = self.model.predict(current_obs, deterministic=True)
 
                 # Store prediction (action)
                 predictions.append(action[0])
 
-                # Step environment
-                obs, _, done, _, _ = test_env.step(action)
+                # Step environment to get next observation for the *next* prediction
+                # We pass the *predicted* action to the environment step
+                next_obs, _, terminated, truncated, _ = test_env.step(action)
+                current_obs = next_obs
 
-                if done:
+                # Check for termination or truncation
+                if terminated or truncated:
                     break
+
+            # Pad predictions if the loop broke early
+            if len(predictions) < len(X):
+                padding = np.zeros(len(X) - len(predictions))
+                predictions.extend(padding)
 
             return np.array(predictions)
 
@@ -501,17 +556,17 @@ class LSTMPPO(BaseModel):
             logger.error(f"Error predicting with LSTM-PPO model: {e}")
             return np.array([])
 
-    def get_policy(self) -> Any:
+    def get_policy(self) -> Optional[ActorCriticPolicy]:
         """Get the trained policy.
 
         Returns:
-            Trained policy
+            Trained policy or None if not fitted
         """
         if not self.is_fitted or self.model is None:
             logger.warning("LSTM-PPO model not fitted yet")
             return None
 
-        return self.model.policy
+        return self.model.policy  # type: ignore
 
     def save(self, directory: Path = MODELS_DIR) -> Path:
         """Save the model to disk.
@@ -520,7 +575,7 @@ class LSTMPPO(BaseModel):
             directory: Directory to save the model
 
         Returns:
-            Path to the saved model
+            Path to the saved model directory
         """
         # Create directory if it doesn't exist
         directory.mkdir(exist_ok=True, parents=True)
@@ -534,6 +589,23 @@ class LSTMPPO(BaseModel):
             model_path = model_dir / "model.zip"
             self.model.save(model_path)
             logger.info(f"LSTM-PPO model saved to {model_path}")
+        else:
+            logger.warning("LSTM-PPO model not saved: model is not fitted.")
+
+        # Save parameters (optional, but good practice)
+        params_path = model_dir / "params.pkl"
+        params = {
+            "target_column": self.target_column,
+            "horizon": self.horizon,
+            "features": self.features,
+            "window_size": self.window_size,
+            "learning_rate": self.learning_rate,
+            # Include other relevant hyperparameters if needed
+            "is_fitted": self.is_fitted,
+            "feature_names": self.feature_names,
+        }
+        with open(params_path, "wb") as f:
+            pickle.dump(params, f)
 
         return model_dir
 
@@ -541,20 +613,34 @@ class LSTMPPO(BaseModel):
         """Load model from disk.
 
         Args:
-            model_path: Path to the saved model
+            model_path: Path to the saved model zip file (e.g., .../model.zip)
 
         Returns:
             Loaded model
         """
         try:
-            # Create a dummy environment to initialize the model
+            # Load parameters first if they exist
+            params_path = model_path.parent / "params.pkl"
+            if params_path.exists():
+                with open(params_path, "rb") as f:
+                    params = pickle.load(f)
+                # Restore parameters (optional but good practice)
+                self.target_column = params.get("target_column", self.target_column)
+                self.horizon = params.get("horizon", self.horizon)
+                self.features = params.get("features", self.features)
+                self.window_size = params.get("window_size", self.window_size)
+                self.learning_rate = params.get("learning_rate", self.learning_rate)
+                self.feature_names = params.get("feature_names", [])
+                # is_fitted will be set after successful model load
+
+            # Create a dummy environment required for loading
+            # Ensure features and target_column are set before creating env
             dummy_df = pd.DataFrame({feature: np.zeros(self.window_size + 1) for feature in self.features})
             dummy_df[self.target_column] = 0.0
-
             self.env = self._create_environment(dummy_df)
 
             # Load the model
-            self.model = PPO.load(model_path, env=self.env)
+            self.model = PPO.load(model_path, env=self.env, device=self.device)  # type: ignore
             self.is_fitted = True
 
             logger.info(f"LSTM-PPO model loaded from {model_path}")
@@ -562,4 +648,5 @@ class LSTMPPO(BaseModel):
             return self
         except Exception as e:
             logger.error(f"Error loading LSTM-PPO model from {model_path}: {e}")
+            self.is_fitted = False
             raise
