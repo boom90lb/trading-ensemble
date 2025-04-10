@@ -70,7 +70,7 @@ class SentimentAnalyzer:
 
             # Make API request
             headers = {"Authorization": f"Bearer {self.api_key}"}
-            response = requests.get("https://api.polygon.io/v2/reference/news", params=params, headers=headers)
+            response = requests.get("https://api.polygon.io/v2/reference/news", params=params, headers=headers)  # type: ignore
             response.raise_for_status()
             data = response.json()
 

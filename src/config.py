@@ -25,7 +25,25 @@ for directory in [DATA_DIR, MODELS_DIR, RESULTS_DIR]:
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
+# JAX configuration
+JAX_CONFIG = {
+    "jit": True,  # Use just-in-time compilation
+    "device": "gpu",  # 'cpu' or 'gpu'
+    "precision": "float32",  # 'float32' or 'float64'
+    "memory_fraction": 0.8,  # Fraction of GPU memory to use
+}
 
+# Update DEFAULT_MODEL_WEIGHTS for better balance with JAX models
+DEFAULT_MODEL_WEIGHTS = {
+    "arima": 0.8,
+    "prophet": 0.8,
+    "lstm": 1.5,  # Higher weight for JAX-based LSTM
+    "xgboost": 1.0,
+    "lstm_ppo": 2.0,  # Higher weight for RL model
+}
+
+
+# Add JAX-specific configuration to ModelConfig
 @dataclass
 class ModelConfig:
     """Configuration for individual model in the ensemble."""
@@ -34,6 +52,7 @@ class ModelConfig:
     enabled: bool = True
     weight: float = 1.0
     params: Optional[dict] = None
+    jax_config: Optional[dict] = None  # JAX-specific settings
 
 
 @dataclass
