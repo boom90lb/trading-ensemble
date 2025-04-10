@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trading-ensemble"
-version = "0.0.4"
+version = "0.1.1"
 authors = [
     {name = "Brendon Reperttang", email = "boom90lb@mit.alum.edu"},
 ]
@@ -18,6 +18,14 @@ classifiers = [
 ]
 
 dependencies = [
+    "jax>=0.5.3",
+    "jaxlib>=0.5.3",
+    "jaxtyping>=0.3.1",
+    "flax>=0.10.5",
+    "chex>=0.1.89",
+    "distrax>=0.1.5",
+    "optax>=0.2.4",
+    "einops>=0.8.1",
     "numpy>=1.24.0",
     "pandas>=2.0.0",
     "scikit-learn>=1.2.0",
@@ -26,9 +34,9 @@ dependencies = [
     "statsmodels>=0.14.0",
     "prophet>=1.1.0",
     "xgboost>=1.7.0",
-    "tensorflow>=2.10.0",
     "torch>=2.0.0",
     "gymnasium>=0.29.0",
+    "plotly>=6.0.1",
     "stable-baselines3>=2.0.0",
     "twelvedata>=1.2.10",
     "polygon-api-client>=0.2.11",
@@ -40,8 +48,6 @@ dependencies = [
     "requests>=2.30.0",
     "pandas-stubs>=2.2.3.250308",
     "types-requests>=2.32.0.20250328",
-    "types-tensorflow>=2.18.0.20250404",
-    "keras>=3.3.0",
 ]
 
 [project.optional-dependencies]
@@ -59,8 +65,8 @@ dev = [
 
 [project.scripts]
 trading-backtest = "scripts.backtest:main"
-trading-predict = "scripts.prediction:main"
-trading-train = "scripts.training:main"
+trading-prediction = "scripts.prediction:main"
+trading-training = "scripts.training:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src", "scripts"]

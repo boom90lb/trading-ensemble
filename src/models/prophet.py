@@ -94,7 +94,8 @@ class ProphetModel(BaseModel):
                     logger.error(f"Error creating/concatenating regressor DataFrame: {e}")
                     # Potentially log shapes for debugging
                     logger.error(
-                        f"prophet_df shape: {prophet_df.shape}, regressors_to_add keys: {list(regressors_to_add.keys())}"
+                        f"prophet_df shape: {prophet_df.shape}, "
+                        f"regressors_to_add keys: {list(regressors_to_add.keys())}"
                     )
                     # Decide how to handle: raise error, return, or continue without regressors?
                     # For now, let's log and continue without regressors in this specific error case

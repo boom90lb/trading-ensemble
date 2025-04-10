@@ -131,6 +131,7 @@ celerybeat.pid
 models/
 data/
 runs/
+tensorboard_logs/
 
 # Environments
 .env

@@ -98,7 +98,7 @@ class DataLoader:
                 params["end_date"] = end_date
 
             # Make API request
-            response = requests.get("https://api.twelvedata.com/time_series", params=params)
+            response = requests.get("https://api.twelvedata.com/time_series", params=params)  # type: ignore
             response.raise_for_status()
             data = response.json()
 
@@ -123,7 +123,7 @@ class DataLoader:
             df = df.sort_index()
 
             # Rename columns to lowercase
-            df.columns = [col.lower() for col in df.columns]
+            df.columns = [col.lower() for col in df.columns]  # type: ignore
 
             # Convert numeric columns
             numeric_cols = ["open", "high", "low", "close", "volume"]
