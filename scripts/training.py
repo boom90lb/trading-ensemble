@@ -9,10 +9,15 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-import pandas as pd  # Import pandas to access the error type
+import numpy as np  # type: ignore
+import pandas as pd  # type: ignore
 
-from src.config import DEFAULT_TRAINING_CONFIG, EnsembleConfig, ModelConfig, TrainingConfig
+from src.config import (
+    DEFAULT_TRAINING_CONFIG,
+    EnsembleConfig,
+    ModelConfig,
+    TrainingConfig,
+)
 from src.data_loader import DataLoader
 from src.features import FeatureEngineer
 from src.models.ensemble import EnsembleModel
@@ -70,7 +75,7 @@ def parse_args():
     parser.add_argument(
         "--models",
         type=str,
-        default="arima,prophet,lstm,xgboost,lstm_ppo",
+        default="arima,prophet,lstm,xgboost,lstm_ppo,xlstm_ppo,xlstm_grpo",
         help="Comma-separated list of models to use in the ensemble",
     )
 
@@ -287,6 +292,8 @@ def main():
         end_date=args.end_date,
         prediction_horizon=args.horizon,
         use_sentiment=args.use_sentiment,
+        optimize=args.optimize,
+        cv_folds=5,  # Default value
     )
 
     logger.info(f"Training configuration: {training_config}")
@@ -445,6 +452,79 @@ def main():
                 # Save selected features for reference
                 with open(output_dir / f"lstm_ppo_features_{symbol}.json", "w") as f:
                     json.dump(lstm_ppo_features, f, indent=2)
+
+            # Handle xlstm_ppo model if it's in the models
+            if "xlstm_ppo" in model_names:
+                # Use the same parameters as lstm_ppo
+                fit_kwargs["xlstm_ppo_timesteps"] = args.rl_timesteps
+                fit_kwargs["xlstm_ppo_checkpoint_freq"] = args.checkpoint_freq
+
+                # Set device for RL model
+                if args.gpu:
+                    fit_kwargs["xlstm_ppo_device"] = "cuda" if gpu_available else "cpu"
+                else:
+                    fit_kwargs["xlstm_ppo_device"] = "cpu"
+
+                # Use the same feature selection as lstm_ppo
+                if "lstm_ppo_features" not in fit_kwargs:
+                    xlstm_ppo_features = select_rl_features(X_train)
+                    fit_kwargs["xlstm_ppo_features"] = xlstm_ppo_features
+                else:
+                    fit_kwargs["xlstm_ppo_features"] = fit_kwargs["lstm_ppo_features"]
+
+                # Pass original close price needed for fitting/environment
+                fit_kwargs["xlstm_ppo_X_train_with_close"] = train_df
+
+                # Pass symbol-specific TensorBoard path
+                xlstm_ppo_log_path = output_dir / f"xlstm_tensorboard_logs_{symbol}"
+                fit_kwargs["xlstm_ppo_tensorboard_log_path"] = str(xlstm_ppo_log_path)
+
+                # Log selected features
+                logger.info(
+                    f"Selected {len(fit_kwargs['xlstm_ppo_features'])} features for xLSTM-PPO model: "
+                    f"{', '.join(fit_kwargs['xlstm_ppo_features'][:5])}..."
+                )
+
+                # Save selected features for reference
+                with open(output_dir / f"xlstm_ppo_features_{symbol}.json", "w") as f:
+                    json.dump(fit_kwargs["xlstm_ppo_features"], f, indent=2)
+
+            # Handle xlstm_grpo model if it's in the models
+            if "xlstm_grpo" in model_names:
+                # Set GRPO training parameters
+                fit_kwargs["xlstm_grpo_updates"] = args.rl_timesteps // 100  # Fewer updates for GRPO
+
+                # Set device for RL model
+                if args.gpu:
+                    fit_kwargs["xlstm_grpo_device"] = "cuda" if gpu_available else "cpu"
+                else:
+                    fit_kwargs["xlstm_grpo_device"] = "cpu"
+
+                # Use the same feature selection as lstm_ppo
+                if "lstm_ppo_features" not in fit_kwargs and "xlstm_ppo_features" not in fit_kwargs:
+                    xlstm_grpo_features = select_rl_features(X_train)
+                    fit_kwargs["xlstm_grpo_features"] = xlstm_grpo_features
+                elif "lstm_ppo_features" in fit_kwargs:
+                    fit_kwargs["xlstm_grpo_features"] = fit_kwargs["lstm_ppo_features"]
+                else:
+                    fit_kwargs["xlstm_grpo_features"] = fit_kwargs["xlstm_ppo_features"]
+
+                # Pass original close price needed for fitting/environment
+                fit_kwargs["xlstm_grpo_X_train_with_close"] = train_df
+
+                # Pass symbol-specific TensorBoard path
+                xlstm_grpo_log_path = output_dir / f"xlstm_grpo_logs_{symbol}"
+                fit_kwargs["xlstm_grpo_log_path"] = str(xlstm_grpo_log_path)
+
+                # Log selected features
+                logger.info(
+                    f"Selected {len(fit_kwargs['xlstm_grpo_features'])} features for xLSTM-GRPO model: "
+                    f"{', '.join(fit_kwargs['xlstm_grpo_features'][:5])}..."
+                )
+
+                # Save selected features for reference
+                with open(output_dir / f"xlstm_grpo_features_{symbol}.json", "w") as f:
+                    json.dump(fit_kwargs["xlstm_grpo_features"], f, indent=2)
 
             ensemble.fit(X_train, y_train, **fit_kwargs)
         except Exception as e:

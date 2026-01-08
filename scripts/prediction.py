@@ -7,9 +7,9 @@ import pickle
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
+import matplotlib.pyplot as plt  # type: ignore
+import numpy as np  # type: ignore
+import pandas as pd  # type: ignore
 
 from src.config import MODELS_DIR, RESULTS_DIR
 from src.data_loader import DataLoader
