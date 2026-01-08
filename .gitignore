@@ -128,7 +128,7 @@ celerybeat.pid
 *.sage.py
 
 # Models, Data, and Runs
-models/
+/models/
 data/
 runs/
 tensorboard_logs/
