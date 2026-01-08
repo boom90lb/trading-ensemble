@@ -393,6 +393,8 @@ class FeatureEngineer(nnx.Module):
 
                 # Convert to numpy array for NNX scaler
                 technical_data_np = technical_data.values
+                # Log the shape for debugging
+                logger.info(f"Technical data shape for {symbol}: {technical_data_np.shape}")
                 self.technical_scalers[symbol].fit(technical_data_np)
 
             # Initialize and fit sentiment scaler
@@ -469,6 +471,55 @@ class FeatureEngineer(nnx.Module):
                 if not result[price_cols].empty:
                     # Convert to numpy array for NNX scaler
                     price_data_np = result[price_cols].values
+                    # Log shapes for debugging
+                    logger.info(f"Transform - Price data shape for {symbol}: {price_data_np.shape}")
+                    logger.info(f"Transform - Price scaler min_vals shape: {price_scaler.min_vals.value.shape}")
+
+                    # Ensure compatible shapes
+                    if price_data_np.shape[1] != price_scaler.min_vals.value.shape[0]:
+                        logger.warning(f"Shape mismatch in price data for {symbol}. Adjusting scaler parameters.")
+                        # Adjust scaler parameters to match the data shape
+                        if price_scaler.scaler_type == "minmax":
+                            # Extend or truncate min_vals and max_vals to match data shape
+                            cols = price_data_np.shape[1]
+                            current_vals = price_scaler.min_vals.value.shape[0]
+
+                            if cols > current_vals:
+                                # Extend with zeros/ones
+                                price_scaler.min_vals.value = np.pad(
+                                    price_scaler.min_vals.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=0,
+                                )
+                                price_scaler.max_vals.value = np.pad(
+                                    price_scaler.max_vals.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=1,
+                                )
+                            else:
+                                # Truncate
+                                price_scaler.min_vals.value = price_scaler.min_vals.value[:cols]
+                                price_scaler.max_vals.value = price_scaler.max_vals.value[:cols]
+                        elif price_scaler.scaler_type == "standard":
+                            # Extend or truncate mean and std to match data shape
+                            cols = price_data_np.shape[1]
+                            current_vals = price_scaler.mean.value.shape[0]
+
+                            if cols > current_vals:
+                                # Extend with zeros/ones
+                                price_scaler.mean.value = np.pad(
+                                    price_scaler.mean.value, (0, cols - current_vals), "constant", constant_values=0
+                                )
+                                price_scaler.std.value = np.pad(
+                                    price_scaler.std.value, (0, cols - current_vals), "constant", constant_values=1
+                                )
+                            else:
+                                # Truncate
+                                price_scaler.mean.value = price_scaler.mean.value[:cols]
+                                price_scaler.std.value = price_scaler.std.value[:cols]
+
                     transformed_data = price_scaler.transform(price_data_np)
                     result[price_cols] = transformed_data
 
@@ -487,6 +538,55 @@ class FeatureEngineer(nnx.Module):
                 if not result[volume_cols].empty:
                     # Convert to numpy array for NNX scaler
                     volume_data_np = result[volume_cols].values
+                    # Log shapes for debugging
+                    logger.info(f"Transform - Volume data shape for {symbol}: {volume_data_np.shape}")
+                    logger.info(f"Transform - Volume scaler min_vals shape: {volume_scaler.min_vals.value.shape}")
+
+                    # Ensure compatible shapes
+                    if volume_data_np.shape[1] != volume_scaler.min_vals.value.shape[0]:
+                        logger.warning(f"Shape mismatch in volume data for {symbol}. Adjusting scaler parameters.")
+                        # Adjust scaler parameters to match the data shape
+                        if volume_scaler.scaler_type == "minmax":
+                            # Extend or truncate min_vals and max_vals to match data shape
+                            cols = volume_data_np.shape[1]
+                            current_vals = volume_scaler.min_vals.value.shape[0]
+
+                            if cols > current_vals:
+                                # Extend with zeros/ones
+                                volume_scaler.min_vals.value = np.pad(
+                                    volume_scaler.min_vals.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=0,
+                                )
+                                volume_scaler.max_vals.value = np.pad(
+                                    volume_scaler.max_vals.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=1,
+                                )
+                            else:
+                                # Truncate
+                                volume_scaler.min_vals.value = volume_scaler.min_vals.value[:cols]
+                                volume_scaler.max_vals.value = volume_scaler.max_vals.value[:cols]
+                        elif volume_scaler.scaler_type == "standard":
+                            # Extend or truncate mean and std to match data shape
+                            cols = volume_data_np.shape[1]
+                            current_vals = volume_scaler.mean.value.shape[0]
+
+                            if cols > current_vals:
+                                # Extend with zeros/ones
+                                volume_scaler.mean.value = np.pad(
+                                    volume_scaler.mean.value, (0, cols - current_vals), "constant", constant_values=0
+                                )
+                                volume_scaler.std.value = np.pad(
+                                    volume_scaler.std.value, (0, cols - current_vals), "constant", constant_values=1
+                                )
+                            else:
+                                # Truncate
+                                volume_scaler.mean.value = volume_scaler.mean.value[:cols]
+                                volume_scaler.std.value = volume_scaler.std.value[:cols]
+
                     transformed_data = volume_scaler.transform(volume_data_np)
                     result[volume_cols] = transformed_data
 
@@ -502,6 +602,63 @@ class FeatureEngineer(nnx.Module):
                 if not result[technical_cols].empty:
                     # Convert to numpy array for NNX scaler
                     technical_data_np = result[technical_cols].values
+                    # Log shapes for debugging
+                    logger.info(f"Transform - Technical data shape for {symbol}: {technical_data_np.shape}")
+                    logger.info(
+                        f"Transform - Technical scaler min_vals shape: {technical_scaler.min_vals.value.shape}"
+                    )
+                    logger.info(
+                        f"Transform - Technical scaler max_vals shape: {technical_scaler.max_vals.value.shape}"
+                    )
+
+                    # Ensure compatible shapes
+                    if technical_data_np.shape[1] != technical_scaler.min_vals.value.shape[0]:
+                        logger.warning(f"Shape mismatch in technical data for {symbol}. Adjusting scaler parameters.")
+                        # Adjust scaler parameters to match the data shape
+                        if technical_scaler.scaler_type == "minmax":
+                            # Extend or truncate min_vals and max_vals to match data shape
+                            cols = technical_data_np.shape[1]
+                            current_vals = technical_scaler.min_vals.value.shape[0]
+
+                            if cols > current_vals:
+                                # Extend with zeros/ones
+                                technical_scaler.min_vals.value = np.pad(
+                                    technical_scaler.min_vals.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=0,
+                                )
+                                technical_scaler.max_vals.value = np.pad(
+                                    technical_scaler.max_vals.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=1,
+                                )
+                            else:
+                                # Truncate
+                                technical_scaler.min_vals.value = technical_scaler.min_vals.value[:cols]
+                                technical_scaler.max_vals.value = technical_scaler.max_vals.value[:cols]
+                        elif technical_scaler.scaler_type == "standard":
+                            # Extend or truncate mean and std to match data shape
+                            cols = technical_data_np.shape[1]
+                            current_vals = technical_scaler.mean.value.shape[0]
+
+                            if cols > current_vals:
+                                # Extend with zeros/ones
+                                technical_scaler.mean.value = np.pad(
+                                    technical_scaler.mean.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=0,
+                                )
+                                technical_scaler.std.value = np.pad(
+                                    technical_scaler.std.value, (0, cols - current_vals), "constant", constant_values=1
+                                )
+                            else:
+                                # Truncate
+                                technical_scaler.mean.value = technical_scaler.mean.value[:cols]
+                                technical_scaler.std.value = technical_scaler.std.value[:cols]
+
                     transformed_data = technical_scaler.transform(technical_data_np)
                     result[technical_cols] = transformed_data
 
@@ -514,6 +671,60 @@ class FeatureEngineer(nnx.Module):
                 if not result[sentiment_cols].empty:
                     # Convert to numpy array for NNX scaler
                     sentiment_data_np = result[sentiment_cols].values
+                    # Log shapes for debugging
+                    logger.info(f"Transform - Sentiment data shape for {symbol}: {sentiment_data_np.shape}")
+                    logger.info(
+                        f"Transform - Sentiment scaler min_vals shape: {sentiment_scaler.min_vals.value.shape}"
+                    )
+
+                    # Ensure compatible shapes
+                    if sentiment_data_np.shape[1] != sentiment_scaler.min_vals.value.shape[0]:
+                        logger.warning(f"Shape mismatch in sentiment data for {symbol}. Adjusting scaler parameters.")
+                        # Adjust scaler parameters to match the data shape
+                        if sentiment_scaler.scaler_type == "minmax":
+                            # Extend or truncate min_vals and max_vals to match data shape
+                            cols = sentiment_data_np.shape[1]
+                            current_vals = sentiment_scaler.min_vals.value.shape[0]
+
+                            if cols > current_vals:
+                                # Extend with zeros/ones
+                                sentiment_scaler.min_vals.value = np.pad(
+                                    sentiment_scaler.min_vals.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=0,
+                                )
+                                sentiment_scaler.max_vals.value = np.pad(
+                                    sentiment_scaler.max_vals.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=1,
+                                )
+                            else:
+                                # Truncate
+                                sentiment_scaler.min_vals.value = sentiment_scaler.min_vals.value[:cols]
+                                sentiment_scaler.max_vals.value = sentiment_scaler.max_vals.value[:cols]
+                        elif sentiment_scaler.scaler_type == "standard":
+                            # Extend or truncate mean and std to match data shape
+                            cols = sentiment_data_np.shape[1]
+                            current_vals = sentiment_scaler.mean.value.shape[0]
+
+                            if cols > current_vals:
+                                # Extend with zeros/ones
+                                sentiment_scaler.mean.value = np.pad(
+                                    sentiment_scaler.mean.value,
+                                    (0, cols - current_vals),
+                                    "constant",
+                                    constant_values=0,
+                                )
+                                sentiment_scaler.std.value = np.pad(
+                                    sentiment_scaler.std.value, (0, cols - current_vals), "constant", constant_values=1
+                                )
+                            else:
+                                # Truncate
+                                sentiment_scaler.mean.value = sentiment_scaler.mean.value[:cols]
+                                sentiment_scaler.std.value = sentiment_scaler.std.value[:cols]
+
                     transformed_data = sentiment_scaler.transform(sentiment_data_np)
                     result[sentiment_cols] = transformed_data
 

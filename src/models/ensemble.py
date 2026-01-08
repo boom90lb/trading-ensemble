@@ -8,7 +8,11 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score  # type: ignore
+from sklearn.metrics import (  # type: ignore
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
 
 from src.config import MODELS_DIR, EnsembleConfig
 from src.models.base import BaseModel
@@ -38,7 +42,11 @@ class EnsembleModel(BaseModel):
         self.weights: Dict[str, float] = {}  # Dictionary of {model_name: weight}
         self.errors: Dict[str, float] = {}  # Dictionary of {model_name: error_metric}
         self.is_fitted = False
+
+        # Store paths for RL models
         self.lstm_ppo_save_path: Optional[Path] = None  # Store path for LSTMPPO
+        self.xlstm_ppo_save_path: Optional[Path] = None  # Store path for XLSTMPPOAgent
+        self.xlstm_grpo_save_path: Optional[Path] = None  # Store path for XLSTMGRPOAgent
 
         # Initialize models and weights from config
         for model_config in self.config.models:
@@ -92,6 +100,16 @@ class EnsembleModel(BaseModel):
             elif model_name == "lstm_ppo":
                 # LSTM-PPO is now created directly
                 return LSTMPPO(target_column=self.target_column, horizon=self.horizon)
+            elif model_name == "xlstm_ppo":
+                # Import the XLSTMPPOAgent model
+                from src.models.xlstm_ppo import XLSTMPPOAgent
+
+                return XLSTMPPOAgent(target_column=self.target_column, horizon=self.horizon)
+            elif model_name == "xlstm_grpo":
+                # Import the XLSTMGRPOAgent model
+                from src.models.xlstm_grpo import XLSTMGRPOAgent
+
+                return XLSTMGRPOAgent(target_column=self.target_column, horizon=self.horizon)
             else:
                 logger.warning(f"Unsupported model: {model_name}")
                 return None
@@ -144,6 +162,62 @@ class EnsembleModel(BaseModel):
                         self.lstm_ppo_save_path = save_path
                     else:
                         logger.error(f"Model {name} is not an instance of LSTMPPO as expected.")
+                        continue
+
+                elif name == "xlstm_ppo":
+                    # Special handling for xLSTM-PPO
+                    xlstm_ppo_timesteps = kwargs.get("xlstm_ppo_timesteps", 100000)
+                    xlstm_ppo_features = kwargs.get("xlstm_ppo_features")
+                    xlstm_ppo_X_train_with_close = kwargs.get("xlstm_ppo_X_train_with_close")
+
+                    if xlstm_ppo_features is None or xlstm_ppo_X_train_with_close is None:
+                        logger.error(
+                            "Missing required arguments for XLSTMPPOAgent fitting: "
+                            "'xlstm_ppo_features' or 'xlstm_ppo_X_train_with_close'"
+                        )
+                        continue
+
+                    # Ensure model is XLSTMPPOAgent type
+                    from src.models.xlstm_ppo import XLSTMPPOAgent
+
+                    if isinstance(model, XLSTMPPOAgent):
+                        # Prepare data (select features, ensure close price is present)
+                        model.features = xlstm_ppo_features
+                        # XLSTMPPOAgent fit method expects DataFrame with features + close price
+                        model.fit(xlstm_ppo_X_train_with_close, y_train, total_timesteps=xlstm_ppo_timesteps)
+                        # Save xLSTM-PPO separately immediately after fitting and store its path
+                        save_path = model.save()
+                        self.xlstm_ppo_save_path = save_path
+                    else:
+                        logger.error(f"Model {name} is not an instance of XLSTMPPOAgent as expected.")
+                        continue
+
+                elif name == "xlstm_grpo":
+                    # Special handling for xLSTM-GRPO
+                    xlstm_grpo_updates = kwargs.get("xlstm_grpo_updates", 1000)
+                    xlstm_grpo_features = kwargs.get("xlstm_grpo_features")
+                    xlstm_grpo_X_train_with_close = kwargs.get("xlstm_grpo_X_train_with_close")
+
+                    if xlstm_grpo_features is None or xlstm_grpo_X_train_with_close is None:
+                        logger.error(
+                            "Missing required arguments for XLSTMGRPOAgent fitting: "
+                            "'xlstm_grpo_features' or 'xlstm_grpo_X_train_with_close'"
+                        )
+                        continue
+
+                    # Ensure model is XLSTMGRPOAgent type
+                    from src.models.xlstm_grpo import XLSTMGRPOAgent
+
+                    if isinstance(model, XLSTMGRPOAgent):
+                        # Prepare data (select features, ensure close price is present)
+                        model.features = xlstm_grpo_features
+                        # XLSTMGRPOAgent fit method expects DataFrame with features + close price
+                        model.fit(xlstm_grpo_X_train_with_close, y_train, total_updates=xlstm_grpo_updates)
+                        # Save xLSTM-GRPO separately immediately after fitting and store its path
+                        save_path = model.save()
+                        self.xlstm_grpo_save_path = save_path
+                    else:
+                        logger.error(f"Model {name} is not an instance of XLSTMGRPOAgent as expected.")
                         continue
                 else:
                     # Standard fitting for other models
@@ -393,16 +467,26 @@ class EnsembleModel(BaseModel):
         }
 
         # Include fitted models state/path
-        for name, model_instance in self.models.items():
+        for name in self.models.keys():
             if name == "lstm_ppo":
                 if self.lstm_ppo_save_path:
                     save_state["models"][name] = str(self.lstm_ppo_save_path)
                 else:
                     logger.warning("LSTMPPO model was fitted but no save path was stored.")
+            elif name == "xlstm_ppo":
+                if self.xlstm_ppo_save_path:
+                    save_state["models"][name] = str(self.xlstm_ppo_save_path)
+                else:
+                    logger.warning("XLSTMPPOAgent model was fitted but no save path was stored.")
+            elif name == "xlstm_grpo":
+                if self.xlstm_grpo_save_path:
+                    save_state["models"][name] = str(self.xlstm_grpo_save_path)
+                else:
+                    logger.warning("XLSTMGRPOAgent model was fitted but no save path was stored.")
             else:
                 # Add handling for other model types if they need specific saving
                 # For now, we assume they are handled elsewhere or not saved with the ensemble state
-                # Example: save_state['models'][name] = model_instance.save(directory / name)
+                # Example: save_state['models'][name] = self.models[name].save(directory / name)
                 pass
 
         # Save the state to the pickle file
@@ -435,7 +519,11 @@ class EnsembleModel(BaseModel):
         self.errors = loaded_state["errors"]
         self.is_fitted = loaded_state["is_fitted"]
         self.models = {}  # Initialize empty
-        self.lstm_ppo_save_path = None  # Initialize path attribute
+
+        # Initialize path attributes
+        self.lstm_ppo_save_path = None
+        self.xlstm_ppo_save_path = None
+        self.xlstm_grpo_save_path = None
 
         # Load models
         for name, saved_model_info in loaded_state["models"].items():
@@ -457,6 +545,46 @@ class EnsembleModel(BaseModel):
                 except Exception as e:
                     logger.error(f"Error loading LSTMPPO model from path {saved_model_info}: {e}")
                     self.is_fitted = False  # Mark as not fitted if LSTMPPO failed to load
+            elif name == "xlstm_ppo":
+                # Load XLSTMPPOAgent from its saved path string
+                try:
+                    from src.models.xlstm_ppo import XLSTMPPOAgent
+
+                    xlstm_ppo_path_str = str(saved_model_info)
+                    xlstm_ppo_path = Path(xlstm_ppo_path_str)
+                    self.xlstm_ppo_save_path = xlstm_ppo_path  # Store the loaded path
+
+                    if xlstm_ppo_path.exists() and (xlstm_ppo_path / "config.pkl").exists():
+                        # Re-initialize the model instance before loading
+                        xlstm_ppo_model = XLSTMPPOAgent(target_column=self.target_column, horizon=self.horizon)
+                        xlstm_ppo_model.load(xlstm_ppo_path)
+                        self.models[name] = xlstm_ppo_model
+                    else:
+                        logger.warning(f"XLSTMPPOAgent model path or file not found: {xlstm_ppo_path}")
+                        self.is_fitted = False  # Mark as not fitted if XLSTMPPOAgent failed to load
+                except Exception as e:
+                    logger.error(f"Error loading XLSTMPPOAgent model from path {saved_model_info}: {e}")
+                    self.is_fitted = False  # Mark as not fitted if XLSTMPPOAgent failed to load
+            elif name == "xlstm_grpo":
+                # Load XLSTMGRPOAgent from its saved path string
+                try:
+                    from src.models.xlstm_grpo import XLSTMGRPOAgent
+
+                    xlstm_grpo_path_str = str(saved_model_info)
+                    xlstm_grpo_path = Path(xlstm_grpo_path_str)
+                    self.xlstm_grpo_save_path = xlstm_grpo_path  # Store the loaded path
+
+                    if xlstm_grpo_path.exists() and (xlstm_grpo_path / "config.pkl").exists():
+                        # Re-initialize the model instance before loading
+                        xlstm_grpo_model = XLSTMGRPOAgent(target_column=self.target_column, horizon=self.horizon)
+                        xlstm_grpo_model.load(xlstm_grpo_path)
+                        self.models[name] = xlstm_grpo_model
+                    else:
+                        logger.warning(f"XLSTMGRPOAgent model path or file not found: {xlstm_grpo_path}")
+                        self.is_fitted = False  # Mark as not fitted if XLSTMGRPOAgent failed to load
+                except Exception as e:
+                    logger.error(f"Error loading XLSTMGRPOAgent model from path {saved_model_info}: {e}")
+                    self.is_fitted = False  # Mark as not fitted if XLSTMGRPOAgent failed to load
             else:
                 # Assume other models were pickled directly
                 self.models[name] = saved_model_info
