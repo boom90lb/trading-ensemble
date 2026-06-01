@@ -101,6 +101,12 @@ class LSTMModel(BaseModel):
         self.optimizer = optax.adam(learning_rate=self.learning_rate)
         self.feature_names = []
 
+    @property
+    def required_history(self) -> int:
+        """predict() needs ``sequence_length`` rows to form one input window
+        (it warns and returns short otherwise)."""
+        return self.sequence_length
+
     def _create_sequences(self, data) -> Tuple[Any, Any]:
         """Create sequences for LSTM input."""
         X, y = [], []
@@ -185,7 +191,18 @@ class LSTMModel(BaseModel):
                 self.is_fitted = False
                 return self
 
-            num_batches = len(X) // self.batch_size
+            # B11: clamp to len(X) so the inner loop always runs at least once.
+            # Without this, num_batches=0 silently leaves best_params=None and
+            # the model ships untrained — which now bites meta-learner KFold
+            # folds (Phase 1.2), where len(fold) < self.batch_size is plausible.
+            # Don't mutate self.batch_size; config is persisted via save_config.
+            effective_batch_size = min(self.batch_size, len(X))
+            if effective_batch_size < self.batch_size:
+                logger.warning(
+                    f"LSTM batch_size={self.batch_size} > len(X)={len(X)}; "
+                    f"clamping to {effective_batch_size} for this fit."
+                )
+            num_batches = len(X) // effective_batch_size
             patience = 25
             best_loss = float("inf")
             patience_counter = 0
@@ -204,12 +221,12 @@ class LSTMModel(BaseModel):
 
                 epoch_loss = 0.0
                 for batch in range(num_batches):
-                    batch_start = batch * self.batch_size
-                    batch_end = batch_start + self.batch_size
+                    batch_start = batch * effective_batch_size
+                    batch_end = batch_start + effective_batch_size
                     batch_x_np = X_shuffled[batch_start:batch_end]
                     batch_y_np = y_shuffled[batch_start:batch_end]
 
-                    if len(batch_x_np) < self.batch_size:
+                    if len(batch_x_np) < effective_batch_size:
                         continue
 
                     batch_x = jnp.array(batch_x_np)

@@ -105,6 +105,10 @@ class FeatureEngineer(nnx.Module):
         self.volume_scalers: Dict[str, ScalerModule] = {}
         self.technical_scalers: Dict[str, ScalerModule] = {}
         self.sentiment_scalers: Dict[str, ScalerModule] = {}
+        # Train-only outlier-clip bounds keyed by (symbol, column). Populated in
+        # fit_scalers and reused in transform_features so test-time clipping
+        # never consumes test-set statistics.
+        self.clip_bounds: Dict[str, Dict[str, tuple]] = {}
 
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create technical indicators and features.
@@ -337,6 +341,9 @@ class FeatureEngineer(nnx.Module):
 
             sentiment_cols = [col for col in df.columns if "sentiment" in col.lower()]
 
+            # Train-only clip bounds for this symbol (overwritten on re-fit).
+            symbol_bounds: Dict[str, tuple] = {}
+
             # Initialize and fit price scaler
             if self.price_scaler_type.lower() != "none" and price_cols:
                 # Create NNX scaler module if it doesn't exist
@@ -345,14 +352,16 @@ class FeatureEngineer(nnx.Module):
 
                 # Handle NaNs before fitting
                 price_data = df[price_cols].dropna()
-                # Handle outliers - clip extreme values
+                # Handle outliers - clip extreme values; record bounds for transform.
                 for col in price_cols:
                     if col in price_data.columns:
-                        # Use 3 standard deviations for clipping
                         mean = price_data[col].mean()
                         std = price_data[col].std()
-                        if std > 0:  # Avoid division by zero
-                            price_data[col] = price_data[col].clip(mean - 3 * std, mean + 3 * std)
+                        if std > 0:
+                            lo = float(mean - 3 * std)
+                            hi = float(mean + 3 * std)
+                            price_data[col] = price_data[col].clip(lo, hi)
+                            symbol_bounds[col] = (lo, hi)
 
                 # Convert to numpy array for NNX scaler
                 price_data_np = price_data.values
@@ -385,11 +394,13 @@ class FeatureEngineer(nnx.Module):
                 technical_data = df[technical_cols].dropna()
                 for col in technical_cols:
                     if col in technical_data.columns:
-                        # Use 3 standard deviations for clipping
                         mean = technical_data[col].mean()
                         std = technical_data[col].std()
-                        if std > 0:  # Avoid division by zero
-                            technical_data[col] = technical_data[col].clip(mean - 3 * std, mean + 3 * std)
+                        if std > 0:
+                            lo = float(mean - 3 * std)
+                            hi = float(mean + 3 * std)
+                            technical_data[col] = technical_data[col].clip(lo, hi)
+                            symbol_bounds[col] = (lo, hi)
 
                 # Convert to numpy array for NNX scaler
                 technical_data_np = technical_data.values
@@ -410,6 +421,9 @@ class FeatureEngineer(nnx.Module):
                 sentiment_data_np = sentiment_data.values
                 self.sentiment_scalers[symbol].fit(sentiment_data_np)
 
+            # Commit train-only outlier bounds for downstream transform_features.
+            self.clip_bounds[symbol] = symbol_bounds
+
         except Exception as e:
             logger.error(f"Error fitting scalers for {symbol}: {e}")
 
@@ -427,16 +441,15 @@ class FeatureEngineer(nnx.Module):
         result = df.copy()
 
         try:
-            # Handle outliers - clip extreme values
-            numeric_cols = result.select_dtypes(include=["number"]).columns
-            for col in numeric_cols:
+            # Apply train-only outlier-clip bounds recorded in fit_scalers. Columns
+            # without a stored bound (e.g., not present at fit time or fit was
+            # never called for this symbol) pass through unclipped — recomputing
+            # mean/std from `result` would leak test-set statistics into the
+            # transform, which is the B9-adjacent leak this block used to have.
+            symbol_bounds = self.clip_bounds.get(symbol, {})
+            for col, (lo, hi) in symbol_bounds.items():
                 if col in result.columns:
-                    # Use 3 standard deviations for clipping to preserve trend information
-                    # but remove extreme outliers that could affect scaling
-                    mean = result[col].mean()
-                    std = result[col].std()
-                    if std > 0:  # Avoid division by zero
-                        result[col] = result[col].clip(mean - 3 * std, mean + 3 * std)
+                    result[col] = result[col].clip(lo, hi)
 
             # Get column groups
             price_cols = [

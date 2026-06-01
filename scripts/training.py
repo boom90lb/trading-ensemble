@@ -1,265 +1,525 @@
 #!/usr/bin/env python
-"""Script for training the time series ensemble model."""
+"""Train the time series ensemble model with Purged Walk-Forward CV.
+
+Phase 2.2: replaces the previous one-shot 80/20 split with an outer
+PurgedWalkForward loop per symbol. Each fold:
+
+  1. Slices the per-symbol enhanced frame to (train_idx, test_idx).
+  2. Refits FeatureEngineer scalers + clip_bounds on the fold's TRAIN
+     slice only (the leakage fix from Phase 2.8 audit b only protects
+     against transform-time leaks if fit_scalers is called per fold).
+  3. Builds a fresh EnsembleModel; policy members' ``*_X_train_with_close``
+     kwargs are the fold's unscaled TRAIN slice.
+  4. Fits, evaluates on the fold's TEST slice, persists the fold's model
+     under ``runs/{run_name}/{symbol}/fold_{k}/ensemble_model``.
+  5. Logs per-fold metrics to MLflow under nested-run ``{symbol}`` with
+     ``step=fold_idx``; aggregated mean/std metrics logged on the same run.
+
+The outer MLflow run captures top-level params (n_splits, purge_horizon,
+embargo_pct, …) so a downstream backtest can replay the same fold structure.
+"""
 
 import argparse
 import json
 import logging
-import os
 import warnings
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+import mlflow
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
 
 from src.config import (
+    DEFAULT_MODEL_WEIGHTS,
     DEFAULT_TRAINING_CONFIG,
     EnsembleConfig,
     ModelConfig,
     TrainingConfig,
 )
-from src.data_loader import DataLoader
+from src.data_loader import DataLoader, _tz_aware_filter
 from src.features import FeatureEngineer
 from src.models.ensemble import EnsembleModel
 from src.sentiment_analysis import SentimentAnalyzer
+from src.tracking.mlflow_utils import (
+    init_mlflow,
+    log_artifact_dir,
+    log_metrics_safe,
+    log_params_safe,
+)
+from src.validation.walk_forward import PurgedWalkForward
 
 # Suppress specific Pandas warnings (like DataFrame fragmentation)
 try:
     warnings.simplefilter(action="ignore", category=pd.errors.PerformanceWarning)
 except AttributeError:
-    # Older pandas versions might not have this specific error type exposed
-    # You might need a more general filter or upgrade pandas if this is critical
-    warnings.warn("Could not specifically filter PerformanceWarning. Filtering FutureWarning instead.", FutureWarning)
+    warnings.warn(
+        "Could not specifically filter PerformanceWarning. Filtering FutureWarning instead.",
+        FutureWarning,
+    )
     warnings.simplefilter(action="ignore", category=FutureWarning)
 
-# Configure TF log level *before* importing tensorflow
-# os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # ERROR level
-# import tensorflow as tf
-
-# tf.get_logger().setLevel("ERROR")
-
-# Configure base logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
-
-# Silence Prophet logs
 logging.getLogger("prophet").setLevel(logging.WARNING)
 logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Train the time series ensemble model.")
+    parser = argparse.ArgumentParser(
+        description="Train the time series ensemble model with Purged Walk-Forward CV.",
+    )
 
     parser.add_argument(
-        "--symbols",
-        type=str,
+        "--symbols", type=str,
         default=",".join(DEFAULT_TRAINING_CONFIG.symbols),
         help="Comma-separated list of symbols to train on",
     )
-
     parser.add_argument(
-        "--timeframe", type=str, default=DEFAULT_TRAINING_CONFIG.timeframe, help="Time interval (e.g., 1d, 1h)"
+        "--universe", type=str, default=None,
+        help="Path to a universe file (one symbol per line, '#' comments); "
+             "overrides --symbols when given (Phase 4 §4.3).",
     )
-
     parser.add_argument(
-        "--start_date", type=str, default=DEFAULT_TRAINING_CONFIG.start_date, help="Start date in YYYY-MM-DD format"
+        "--universe_asof", type=str, default=None,
+        help="As-of date YYYY-MM-DD: drop symbols with no data at/before this "
+             "date (point-in-time universe guard; best-effort survivorship).",
     )
-
-    parser.add_argument("--end_date", type=str, default=None, help="End date in YYYY-MM-DD format")
-
-    parser.add_argument("--horizon", type=int, default=5, help="Forecast horizon")
-
-    parser.add_argument("--use_sentiment", action="store_true", help="Use sentiment analysis")
-
     parser.add_argument(
-        "--models",
-        type=str,
+        "--timeframe", type=str, default=DEFAULT_TRAINING_CONFIG.timeframe,
+        help="Time interval (e.g., 1d, 1h)",
+    )
+    parser.add_argument(
+        "--start_date", type=str, default=DEFAULT_TRAINING_CONFIG.start_date,
+        help="Start date in YYYY-MM-DD format",
+    )
+    parser.add_argument("--end_date", type=str, default=None,
+                        help="End date in YYYY-MM-DD format")
+    parser.add_argument("--horizon", type=int, default=5,
+                        help="Forecast horizon (bars)")
+    parser.add_argument("--use_sentiment", action="store_true",
+                        help="Use sentiment analysis features")
+    parser.add_argument(
+        "--models", type=str,
         default="arima,prophet,lstm,xgboost,lstm_ppo,xlstm_ppo,xlstm_grpo",
-        help="Comma-separated list of models to use in the ensemble",
+        help="Comma-separated list of ensemble member names",
     )
+    parser.add_argument("--optimize", action="store_true",
+                        help="Run hyperparameter optimization")
+    parser.add_argument("--rl_timesteps", type=int, default=100000,
+                        help="Total timesteps for each PPO member's training")
+    parser.add_argument("--gpu", action="store_true",
+                        help="Enable GPU acceleration if available")
+    parser.add_argument("--checkpoint_freq", type=int, default=50000,
+                        help="Checkpoint frequency for RL training")
+    parser.add_argument("--extended_features", action="store_true",
+                        help="Use extended feature set")
 
-    parser.add_argument("--optimize", action="store_true", help="Optimize hyperparameters")
+    # WFO knobs
+    parser.add_argument("--n_splits", type=int, default=DEFAULT_TRAINING_CONFIG.n_splits,
+                        help="Number of PurgedWalkForward outer folds (>=2)")
+    parser.add_argument("--purge_horizon", type=int, default=None,
+                        help="Bars to drop between train/test (default: --horizon)")
+    parser.add_argument("--embargo_pct", type=float, default=DEFAULT_TRAINING_CONFIG.embargo_pct,
+                        help="Embargo as a fraction of total bars (AFML §7.4)")
+    parser.add_argument("--rolling", action="store_true",
+                        help="Use rolling-window train (default: expanding)")
 
-    parser.add_argument("--rl_timesteps", type=int, default=100000, help="Number of timesteps for RL training")
-
-    parser.add_argument("--gpu", action="store_true", help="Use GPU acceleration if available")
-
-    parser.add_argument(
-        "--checkpoint_freq", type=int, default=50000, help="Frequency for saving checkpoints during RL training"
-    )
-
-    parser.add_argument("--extended_features", action="store_true", help="Use extended feature set for training")
+    # MLflow
+    parser.add_argument("--experiment", type=str, default="trading_ensemble",
+                        help="MLflow experiment name")
 
     return parser.parse_args()
 
 
-def select_rl_features(X_train: pd.DataFrame) -> list:
-    """Select optimal features for the LSTM-PPO model.
+def select_rl_features(X_train: pd.DataFrame) -> List[str]:
+    """Pick a compact feature subset for the RL agents.
 
-    Args:
-        X_train: Training features DataFrame
-
-    Returns:
-        List of selected feature names
+    Priority features focused on price, momentum, vol, and volume. If the
+    pipeline's column set is sparse, we top up with the most recent lagged
+    versions of the available base columns. Capped at 30 features to keep
+    the policy network manageable.
     """
-    # Priority features that are important for trading decisions
     priority_features = [
-        # Base price data
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        # Moving averages
-        "ma5",
-        "ma20",
-        "ema5",
-        "ema20",
-        # Momentum and trend
-        "macd",
-        "macd_hist",
-        "rsi_14",
-        "price_change",
-        "price_change_5",
-        "price_change_10",
-        # Volatility
-        "volatility_5",
-        "volatility_20",
-        "bb_width",
-        "atr_14",
-        # Volume indicators
-        "volume_change",
-        "volume_ma5",
-        "mfi_14",
-        # Other technical indicators
-        "daily_range",
-        "gap",
-        "roc_5",
-        "roc_10",
+        "open", "high", "low", "close", "volume",
+        "ma5", "ma20", "ema5", "ema20",
+        "macd", "macd_hist", "rsi_14",
+        "price_change", "price_change_5", "price_change_10",
+        "volatility_5", "volatility_20", "bb_width", "atr_14",
+        "volume_change", "volume_ma5", "mfi_14",
+        "daily_range", "gap", "roc_5", "roc_10",
     ]
+    available = [f for f in priority_features if f in X_train.columns]
 
-    # Check which of the priority features are actually in the dataframe
-    available_features = [f for f in priority_features if f in X_train.columns]
-
-    # If we have very few features, add some lagged versions
-    if len(available_features) < 10:
-        # Find all lag features for the base features we do have
-        for col in [c for c in X_train.columns if any(c.startswith(f) for f in ["close", "rsi", "macd", "price"])]:
+    if len(available) < 10:
+        for col in [c for c in X_train.columns
+                    if any(c.startswith(f) for f in ["close", "rsi", "macd", "price"])]:
             lag_features = [f for f in X_train.columns if f.startswith(f"{col}_lag")]
-            # Add the most recent lags (lag1, lag2)
-            recent_lags = [f for f in lag_features if f.endswith("lag1") or f.endswith("lag2")]
-            available_features.extend(recent_lags)
+            recent = [f for f in lag_features if f.endswith("lag1") or f.endswith("lag2")]
+            available.extend(recent)
 
-    # Limit to at most 30 features to prevent overfitting
-    if len(available_features) > 30:
-        # Keep the most important indicators
-        essential = [
-            f
-            for f in available_features
-            if f in ["close", "price_change", "rsi_14", "macd", "bb_width", "volatility_20"]
-        ]
+    if len(available) > 30:
+        essential = [f for f in available
+                     if f in ["close", "price_change", "rsi_14",
+                              "macd", "bb_width", "volatility_20"]]
+        volume = [f for f in available if "volume" in f][:3]
+        mas = [f for f in available
+               if f.startswith("ma") or f.startswith("ema")][:4]
+        additional = [f for f in available
+                      if f not in essential + volume + mas]
+        additional = sorted(
+            additional,
+            key=lambda x: priority_features.index(x) if x in priority_features else 999,
+        )[: 30 - len(essential) - len(volume) - len(mas)]
+        available = essential + volume + mas + additional
 
-        # Keep some volume indicators
-        volume = [f for f in available_features if "volume" in f][:3]
-
-        # Keep some moving averages
-        mas = [f for f in available_features if f.startswith("ma") or f.startswith("ema")][:4]
-
-        # Additional features based on importance
-        additional = [f for f in available_features if f not in essential + volume + mas]
-        additional = sorted(additional, key=lambda x: priority_features.index(x) if x in priority_features else 999)[
-            : 30 - len(essential) - len(volume) - len(mas)
-        ]
-
-        available_features = essential + volume + mas + additional
-
-    logger.info(f"Selected {len(available_features)} features for LSTM-PPO model")
-    return available_features
+    logger.info(f"Selected {len(available)} features for RL agents")
+    return available
 
 
-def check_gpu_availability():
-    """Check if GPU is available for TensorFlow and PyTorch."""
-    # Check TensorFlow GPU
-    # tf_gpus = tf.config.list_physical_devices("GPU")
-    # tf_gpu_available = len(tf_gpus) > 0
-    tf_gpu_available = False  # Assume false now that we removed TF
-
-    # Check PyTorch GPU
+def check_gpu_availability() -> bool:
+    """Check whether a CUDA GPU is visible via PyTorch."""
     try:
         import torch
-
-        torch_gpu_available = torch.cuda.is_available()
-        torch_gpu_name = torch.cuda.get_device_name(0) if torch_gpu_available else "None"
+        if torch.cuda.is_available():
+            logger.info(f"PyTorch GPU available: {torch.cuda.get_device_name(0)}")
+            return True
     except ImportError:
-        torch_gpu_available = False
-        torch_gpu_name = "Torch not installed"
-
-    # Log results
-    if tf_gpu_available:
-        # This block will now likely never run, but keep structure for potential future re-integration if needed.
-        # logger.info(f"TensorFlow GPU available: {len(tf_gpus)} device(s)")
-        # for i, gpu in enumerate(tf_gpus):
-        #     logger.info(f"  GPU {i}: {gpu.name}")
-        pass  # Keep the block but do nothing as tf_gpu_available is hardcoded false
-    else:
-        logger.warning("TensorFlow GPU check removed. Relying on PyTorch check.")
-
-    if torch_gpu_available:
-        logger.info(f"PyTorch GPU available: {torch_gpu_name}")
-    else:
-        logger.warning("PyTorch GPU not available, using CPU")
-
-    return tf_gpu_available or torch_gpu_available
+        pass
+    logger.warning("No PyTorch GPU available, using CPU")
+    return False
 
 
 def clean_data_for_training(df: pd.DataFrame) -> pd.DataFrame:
-    """Perform additional data cleaning for training.
+    """Conservative cleanup applied causally on the full enhanced frame.
 
-    Args:
-        df: DataFrame with features
+    * Inf -> NaN (row-wise, causal).
+    * Drop columns with >30% NaN (column-set decision; barely informative).
+    * Forward-fill remaining NaNs (past -> future, causal).
+    * Final fill-with-0 to handle warmup-period leading NaNs.
 
-    Returns:
-        Cleaned DataFrame
+    Outlier clipping is intentionally NOT done here — that lives in
+    ``FeatureEngineer.transform_features`` which uses train-only bounds
+    (Phase 2.8 audit b). Doing 5×IQR clipping on the full frame here
+    would re-introduce a row-level future-leak via the IQR computation.
     """
-    result = df.copy()
-
-    # Replace infinities with NaN
-    result = result.replace([np.inf, -np.inf], np.nan)
-
-    # Check for columns with too many NaNs (over 30%)
-    nan_percentage = result.isna().mean()
-    high_nan_cols = nan_percentage[nan_percentage > 0.3].index.tolist()
-
+    # Phase 4 §4.2: the whole pipeline (point-in-time sentiment join, date
+    # filtering) assumes an ET-localized index. Fail loud if feature building
+    # dropped the tz rather than letting naive timestamps leak downstream.
+    if isinstance(df.index, pd.DatetimeIndex):
+        assert df.index.tz is not None, "training frame index lost its timezone"
+    result = df.replace([np.inf, -np.inf], np.nan)
+    nan_pct = result.isna().mean()
+    high_nan_cols = nan_pct[nan_pct > 0.3].index.tolist()
     if high_nan_cols:
-        logger.warning(f"Dropping {len(high_nan_cols)} columns with >30% NaN values")
+        logger.warning(f"Dropping {len(high_nan_cols)} cols with >30% NaN")
         result = result.drop(columns=high_nan_cols)
-
-    # Forward fill NaNs (using previous values)
-    result = result.ffill()
-
-    # Backward fill any remaining NaNs at the beginning
-    result = result.bfill()
-
-    # Fill any still remaining NaNs with zeros
-    result = result.fillna(0)
-
-    # Check for extreme outliers using IQR method
-    for col in result.select_dtypes(include=["number"]).columns:
-        q1 = result[col].quantile(0.25)
-        q3 = result[col].quantile(0.75)
-        iqr = q3 - q1
-        lower_bound = q1 - 5 * iqr  # 5x IQR for very extreme outliers only
-        upper_bound = q3 + 5 * iqr
-
-        # Count extreme outliers
-        outliers = ((result[col] < lower_bound) | (result[col] > upper_bound)).sum()
-        if outliers > 0:
-            # Clip extreme values
-            result[col] = result[col].clip(lower_bound, upper_bound)
-            logger.debug(f"Clipped {outliers} extreme outliers in column {col}")
-
+    result = result.ffill().fillna(0)
     return result
+
+
+def build_features(
+    raw_df: pd.DataFrame,
+    symbol: str,
+    feature_engineer: FeatureEngineer,
+    sentiment_analyzer: Optional[SentimentAnalyzer],
+    horizon: int,
+) -> pd.DataFrame:
+    """Causally build the full enhanced frame for one symbol.
+
+    Technical indicators (rolling/ewm/pct_change) are causal so they may
+    be computed once on the full series. Sentiment join is point-in-time
+    (Phase 2.8 fix). FE scaling + outlier clipping happens per fold inside
+    ``train_symbol_wfo`` so this frame is intentionally UNSCALED.
+    """
+    df = feature_engineer.create_features(raw_df)
+    df = feature_engineer.create_lagged_features(df, [1, 2, 5, 10])
+    df = feature_engineer.create_target_variable(df, "close", horizon)
+
+    if sentiment_analyzer is not None:
+        sentiment = sentiment_analyzer.create_sentiment_features(
+            symbol, pd.DatetimeIndex(df.index)  # type: ignore
+        )
+        if not sentiment.empty:
+            df = df.join(sentiment)
+
+    df = clean_data_for_training(df)
+    return df
+
+
+def build_policy_fit_kwargs(
+    model_names: List[str],
+    X_train: pd.DataFrame,
+    train_raw: pd.DataFrame,
+    args,
+    gpu_available: bool,
+    fold_dir: Path,
+    symbol: str,
+) -> Dict[str, Any]:
+    """Assemble per-policy fit kwargs for one fold.
+
+    ``train_raw`` is the unscaled fold-TRAIN slice. Each policy member's
+    ``*_X_train_with_close`` kwarg points to this same frame so the
+    member's RL environment sees the actual price series with no
+    scaler-induced distortion. The ensemble's ``_oof_policy`` further
+    subdivides this per inner-fold for meta-learner OOF.
+    """
+    rl_features: Optional[List[str]] = None
+    fit_kwargs: Dict[str, Any] = {}
+
+    def _device() -> str:
+        return "cuda" if (args.gpu and gpu_available) else "cpu"
+
+    def _features() -> List[str]:
+        nonlocal rl_features
+        if rl_features is None:
+            rl_features = select_rl_features(X_train)
+        return rl_features
+
+    for name in model_names:
+        if name == "lstm_ppo":
+            fit_kwargs["lstm_ppo_timesteps"] = args.rl_timesteps
+            fit_kwargs["lstm_ppo_checkpoint_freq"] = args.checkpoint_freq
+            fit_kwargs["lstm_ppo_device"] = _device()
+            fit_kwargs["lstm_ppo_features"] = _features()
+            fit_kwargs["lstm_ppo_X_train_with_close"] = train_raw
+            fit_kwargs["tensorboard_log_path"] = str(
+                fold_dir / f"tensorboard_logs_{symbol}_lstm_ppo"
+            )
+        elif name == "xlstm_ppo":
+            fit_kwargs["xlstm_ppo_timesteps"] = args.rl_timesteps
+            fit_kwargs["xlstm_ppo_checkpoint_freq"] = args.checkpoint_freq
+            fit_kwargs["xlstm_ppo_device"] = _device()
+            fit_kwargs["xlstm_ppo_features"] = _features()
+            fit_kwargs["xlstm_ppo_X_train_with_close"] = train_raw
+            fit_kwargs["xlstm_ppo_tensorboard_log_path"] = str(
+                fold_dir / f"tensorboard_logs_{symbol}_xlstm_ppo"
+            )
+        elif name == "xlstm_grpo":
+            fit_kwargs["xlstm_grpo_updates"] = max(1, args.rl_timesteps // 100)
+            fit_kwargs["xlstm_grpo_device"] = _device()
+            fit_kwargs["xlstm_grpo_features"] = _features()
+            fit_kwargs["xlstm_grpo_X_train_with_close"] = train_raw
+            fit_kwargs["xlstm_grpo_log_path"] = str(
+                fold_dir / f"xlstm_grpo_logs_{symbol}"
+            )
+
+    return fit_kwargs
+
+
+def aggregate_fold_metrics(per_fold_metrics: List[Dict[str, float]]) -> Dict[str, float]:
+    """Mean (+ ddof=1 std when ≥2 folds) over the per-fold metric dicts.
+
+    Non-finite values are dropped before aggregation. A metric absent
+    from any fold simply won't appear in the output.
+    """
+    all_keys: set = set()
+    for m in per_fold_metrics:
+        all_keys.update(m.keys())
+    out: Dict[str, float] = {}
+    for k in all_keys:
+        vals = [m[k] for m in per_fold_metrics
+                if k in m and np.isfinite(m[k])]
+        if not vals:
+            continue
+        out[f"mean_{k}"] = float(np.mean(vals))
+        if len(vals) > 1:
+            out[f"std_{k}"] = float(np.std(vals, ddof=1))
+    return out
+
+
+def train_symbol_wfo(
+    symbol: str,
+    full_df: pd.DataFrame,
+    target_col: str,
+    splitter: PurgedWalkForward,
+    model_configs: List[ModelConfig],
+    model_names: List[str],
+    training_config: TrainingConfig,
+    args,
+    gpu_available: bool,
+    feature_engineer: FeatureEngineer,
+    symbol_dir: Path,
+    weighting_strategy: str = "dynamic",
+    target_vol: float = 1.0,
+    position_cap: float = 1.0,
+) -> List[Dict[str, float]]:
+    """Run the WFO outer loop for one symbol.
+
+    Returns the list of per-fold metric dicts (one per successfully fit
+    fold). Per-fold ensemble pickles land in
+    ``{symbol_dir}/fold_{k}/ensemble_model/``; a ``fold_metrics.json``
+    summarizing per-fold + aggregated metrics is written to
+    ``symbol_dir``.
+
+    ``weighting_strategy``/``target_vol``/``position_cap`` parametrize the
+    EnsembleConfig built per fold so a hyperparameter sweep (Phase 2.7) can
+    vary them; defaults reproduce the pre-sweep behavior (dynamic weighting,
+    unit vol target, unit cap).
+    """
+    usable = full_df.dropna(subset=[target_col]).copy()
+    feature_cols = [
+        c for c in usable.columns
+        if "target_" not in c and "direction_" not in c
+    ]
+
+    log_params_safe({
+        "symbol": symbol,
+        "n_usable_rows": len(usable),
+        "n_features": len(feature_cols),
+    })
+
+    per_fold_metrics: List[Dict[str, float]] = []
+
+    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(usable)):
+        logger.info(
+            f"[{symbol}] fold {fold_idx}: train={len(train_idx)} rows "
+            f"({train_idx[0]}->{train_idx[-1]}), "
+            f"test={len(test_idx)} rows ({test_idx[0]}->{test_idx[-1]})"
+        )
+        fold_dir = symbol_dir / f"fold_{fold_idx}"
+        fold_dir.mkdir(parents=True, exist_ok=True)
+
+        train_raw = usable.iloc[train_idx]
+        test_raw = usable.iloc[test_idx]
+
+        # Fit scalers on TRAIN ONLY for this fold; clip_bounds[symbol]
+        # is overwritten on each call so per-fold leakage is avoided.
+        feature_engineer.fit_scalers(train_raw, symbol)
+        train_scaled = feature_engineer.transform_features(
+            train_raw, symbol, is_train=True,
+        )
+        test_scaled = feature_engineer.transform_features(
+            test_raw, symbol, is_train=False,
+        )
+
+        X_train = train_scaled.drop(
+            columns=[c for c in train_scaled.columns
+                     if "target_" in c or "direction_" in c]
+        )
+        y_train = train_scaled[target_col]
+        X_test = test_scaled.drop(
+            columns=[c for c in test_scaled.columns
+                     if "target_" in c or "direction_" in c]
+        )
+        y_test = test_scaled[target_col]
+        # Defensive: re-align if scalers dropped any columns on test.
+        X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+
+        ensemble = EnsembleModel(
+            target_column="close",
+            horizon=training_config.prediction_horizon,
+            config=EnsembleConfig(
+                models=model_configs,
+                weighting_strategy=weighting_strategy,
+                target_vol=target_vol,
+                position_cap=position_cap,
+            ),
+        )
+
+        fit_kwargs = build_policy_fit_kwargs(
+            model_names=model_names,
+            X_train=X_train,
+            train_raw=train_raw,
+            args=args,
+            gpu_available=gpu_available,
+            fold_dir=fold_dir,
+            symbol=symbol,
+        )
+
+        try:
+            ensemble.fit(X_train, y_train, **fit_kwargs)
+        except Exception as e:
+            logger.error(
+                f"Error fitting ensemble for {symbol} fold {fold_idx}: {e}",
+                exc_info=True,
+            )
+            continue
+
+        metrics = ensemble.evaluate(X_test, y_test)
+        per_fold_metrics.append(metrics)
+        log_metrics_safe(metrics, step=fold_idx, prefix="fold/")
+        log_metrics_safe(
+            {f"{name}_weight": float(w)
+             for name, w in ensemble.weights.items()},
+            step=fold_idx,
+            prefix="fold_weight/",
+        )
+
+        ensemble.save(directory=fold_dir / "ensemble_model")
+        # Persist the fold's split indices so the backtest WFO loop can
+        # iterate the same fold structure deterministically.
+        np.savez(
+            fold_dir / "split_idx.npz",
+            train_idx=train_idx,
+            test_idx=test_idx,
+        )
+
+    if per_fold_metrics:
+        aggregated = aggregate_fold_metrics(per_fold_metrics)
+        log_metrics_safe(aggregated)
+        out_payload = {
+            "per_fold": [
+                {k: float(v) for k, v in m.items()}
+                for m in per_fold_metrics
+            ],
+            "aggregated": {k: float(v) for k, v in aggregated.items()},
+        }
+        with open(symbol_dir / "fold_metrics.json", "w") as f:
+            json.dump(out_payload, f, indent=2)
+
+    return per_fold_metrics
+
+
+def load_universe(path: str) -> List[str]:
+    """Read a tracked universe file: one symbol per line, '#' comments and
+    blank lines ignored (Phase 4 §4.3).
+
+    Order is preserved and duplicates dropped (first occurrence wins) so the
+    file reads as the canonical investable set for a given as-of date.
+    """
+    symbols: List[str] = []
+    for line in Path(path).read_text().splitlines():
+        token = line.split("#", 1)[0].strip()
+        if token and token not in symbols:
+            symbols.append(token)
+    return symbols
+
+
+def filter_universe_asof(
+    all_data: Dict[str, pd.DataFrame], asof: Optional[str]
+) -> Dict[str, pd.DataFrame]:
+    """Drop symbols with no data at or before the as-of date.
+
+    A symbol whose first bar is after ``asof`` was not investable then, so
+    including it is a forward-looking universe bias. This is a best-effort
+    point-in-time guard on the *included* set; it does NOT recover delisted
+    names (true survivorship-free construction needs a delisting database —
+    documented as out of scope in the README). ``asof=None`` is a passthrough.
+    """
+    if not asof:
+        return all_data
+    asof_ts = _tz_aware_filter(asof)
+    kept: Dict[str, pd.DataFrame] = {}
+    for symbol, df in all_data.items():
+        has_early_data = (
+            isinstance(df.index, pd.DatetimeIndex)
+            and len(df) > 0
+            and df.index.min() <= asof_ts
+        )
+        if has_early_data:
+            kept[symbol] = df
+        else:
+            logger.warning(
+                f"Dropping {symbol} from universe: no data at/before as-of {asof}"
+            )
+    return kept
 
 
 def main():
@@ -267,24 +527,27 @@ def main():
     args = parse_args()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Check GPU availability if requested
+    gpu_available = False
     if args.gpu:
         gpu_available = check_gpu_availability()
         if not gpu_available:
             logger.warning("GPU acceleration requested but no GPU available")
 
-    # Parse symbols
-    symbols = args.symbols.split(",")
-    symbols_str = "_".join(symbols)  # Create a string representation for the directory name
-
-    # --- Create unique output directory for this run ---
+    if args.universe:
+        symbols = load_universe(args.universe)
+        logger.info(f"Loaded {len(symbols)} symbols from universe {args.universe}")
+    else:
+        symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if not symbols:
+        logger.error("Empty symbol universe; aborting")
+        return
+    # Keep run-dir names bounded for large universes.
+    symbols_str = "_".join(symbols) if len(symbols) <= 8 else f"{len(symbols)}symbols"
     run_name = f"run_{symbols_str}_{timestamp}"
     output_dir = Path("runs") / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving run artifacts to: {output_dir.resolve()}")
-    # ---
 
-    # Create training config
     training_config = TrainingConfig(
         symbols=symbols,
         timeframe=args.timeframe,
@@ -293,308 +556,116 @@ def main():
         prediction_horizon=args.horizon,
         use_sentiment=args.use_sentiment,
         optimize=args.optimize,
-        cv_folds=5,  # Default value
+        n_splits=args.n_splits,
+        purge_horizon=args.purge_horizon,
+        embargo_pct=args.embargo_pct,
+        expanding=not args.rolling,
     )
-
     logger.info(f"Training configuration: {training_config}")
 
-    # Initialize data loader
+    experiment_id = init_mlflow(args.experiment)
+
     data_loader = DataLoader()
+    all_data = data_loader.fetch_training_data(training_config)
+    all_data = filter_universe_asof(all_data, args.universe_asof)
+    if not all_data:
+        logger.error("No data fetched for any symbol; aborting")
+        return
 
-    # Fetch data
-    logger.info(f"Fetching data for {symbols}")
-    all_data, train_test_splits = data_loader.fetch_and_prepare_training_data(training_config)
-
-    # Initialize feature engineer
     feature_engineer = FeatureEngineer()
+    sentiment_analyzer = (
+        SentimentAnalyzer() if args.use_sentiment else None
+    )
 
-    # Initialize sentiment analyzer if requested
-    sentiment_analyzer = None
-    if args.use_sentiment:
-        logger.info("Initializing sentiment analyzer")
-        sentiment_analyzer = SentimentAnalyzer()
-
-    # Create enhanced datasets with features and sentiment
-    enhanced_data = {}
-    for symbol, (train_df, test_df) in train_test_splits.items():
-        logger.info(f"Creating features for {symbol}")
-
-        # Create technical features
-        train_with_features = feature_engineer.create_features(train_df)
-        test_with_features = feature_engineer.create_features(test_df)
-
-        # Create lagged features
-        train_with_features = feature_engineer.create_lagged_features(train_with_features, [1, 2, 5, 10])
-        test_with_features = feature_engineer.create_lagged_features(test_with_features, [1, 2, 5, 10])
-
-        # Create target variable
-        train_with_features = feature_engineer.create_target_variable(
-            train_with_features, "close", training_config.prediction_horizon
-        )
-        test_with_features = feature_engineer.create_target_variable(
-            test_with_features, "close", training_config.prediction_horizon
+    enhanced_data: Dict[str, pd.DataFrame] = {}
+    for symbol, raw_df in all_data.items():
+        logger.info(f"Building features for {symbol}")
+        enhanced_data[symbol] = build_features(
+            raw_df=raw_df,
+            symbol=symbol,
+            feature_engineer=feature_engineer,
+            sentiment_analyzer=sentiment_analyzer,
+            horizon=training_config.prediction_horizon,
         )
 
-        # Add sentiment features if requested
-        if args.use_sentiment and sentiment_analyzer:
-            logger.info(f"Creating sentiment features for {symbol}")
-            train_sentiment = sentiment_analyzer.create_sentiment_features(
-                symbol, pd.DatetimeIndex(train_with_features.index)  # type: ignore
-            )
-            test_sentiment = sentiment_analyzer.create_sentiment_features(
-                symbol, pd.DatetimeIndex(test_with_features.index)  # type: ignore
-            )
+    model_names = [n.strip() for n in args.models.split(",") if n.strip()]
+    model_configs = [
+        ModelConfig(
+            name=name,
+            enabled=True,
+            weight=DEFAULT_MODEL_WEIGHTS.get(name, 1.0),
+        )
+        for name in model_names
+    ]
 
-            # Join sentiment features
-            if not train_sentiment.empty:
-                train_with_features = train_with_features.join(train_sentiment)
-            if not test_sentiment.empty:
-                test_with_features = test_with_features.join(test_sentiment)
+    splitter = PurgedWalkForward(
+        n_splits=training_config.n_splits,
+        purge_horizon=training_config.effective_purge_horizon,
+        embargo_pct=training_config.embargo_pct,
+        expanding=training_config.expanding,
+    )
 
-        # Additional data cleaning for training
-        train_with_features = clean_data_for_training(train_with_features)
-        test_with_features = clean_data_for_training(test_with_features)
+    target_col = f"target_{training_config.prediction_horizon}"
 
-        # Fit scalers on training data
-        feature_engineer.fit_scalers(train_with_features, symbol)
-
-        # Scale features
-        train_scaled = feature_engineer.transform_features(train_with_features, symbol, is_train=True)
-        test_scaled = feature_engineer.transform_features(test_with_features, symbol, is_train=False)
-
-        # Store enhanced data
-        enhanced_data[symbol] = {"train": train_scaled, "test": test_scaled}
-
-    # Parse model list
-    model_names = args.models.split(",")
-
-    # Create ensemble config
-    model_configs = []
-    for name in model_names:
-        if name.strip():
-            # Higher weight for RL model
-            weight = 2.0 if name == "lstm_ppo" else 1.0
-            model_configs.append(ModelConfig(name=name, enabled=True, weight=weight))
-
-    ensemble_config = EnsembleConfig(models=model_configs, weighting_strategy="dynamic")
-
-    # Create and train ensemble model
-    logger.info("Creating ensemble model")
-    ensemble = EnsembleModel(target_column="close", horizon=training_config.prediction_horizon, config=ensemble_config)
-
-    # Train for each symbol
-    all_run_metrics = {}  # Store metrics for all symbols in this run
-    for symbol, data_dict in enhanced_data.items():
-        logger.info(f"Training ensemble for {symbol}")
-
-        train_df = data_dict["train"]
-        test_df = data_dict["test"]
-
-        # Prepare X and y
-        target_col = f"target_{training_config.prediction_horizon}"
-
-        # Drop rows with NaN in target
-        train_df = train_df.dropna(subset=[target_col])
-        test_df = test_df.dropna(subset=[target_col])
-
-        # Split features and target
-        X_train = train_df.drop(columns=[col for col in train_df.columns if "target_" in col or "direction_" in col])
-        y_train = train_df[target_col]
-
-        X_test = test_df.drop(columns=[col for col in test_df.columns if "target_" in col or "direction_" in col])
-        y_test = test_df[target_col]
-
-        # --- Ensure X_test has the same columns as X_train ---
-        # This is crucial if X_train columns were modified (e.g., by feature selection)
-        # *after* the initial split.
-        X_test = X_test.reindex(
-            columns=X_train.columns, fill_value=0
-        )  # Add missing cols, fill with 0 (or appropriate value)
-        # ---
-
-        # Train the ensemble models
-        logger.info(f"Training ensemble models for {symbol}")
-        try:
-            # Prepare fit kwargs
-            fit_kwargs = {}
-
-            # Pass rl_timesteps for LSTMPPO if it's in the models
-            if "lstm_ppo" in model_names:
-                # Set RL training parameters
-                fit_kwargs["lstm_ppo_timesteps"] = args.rl_timesteps
-                fit_kwargs["lstm_ppo_checkpoint_freq"] = args.checkpoint_freq
-
-                # Set device for RL model
-                if args.gpu:
-                    fit_kwargs["lstm_ppo_device"] = "cuda" if gpu_available else "cpu"
-                else:
-                    fit_kwargs["lstm_ppo_device"] = "cpu"
-
-                # Improved feature selection for LSTM-PPO
-                lstm_ppo_features = select_rl_features(X_train)
-                fit_kwargs["lstm_ppo_features"] = lstm_ppo_features
-
-                # Pass original close price needed for LSTMPPO fitting/environment
-                fit_kwargs["lstm_ppo_X_train_with_close"] = train_df  # Pass the unscaled df
-
-                # --- Pass symbol-specific TensorBoard path ---
-                # Use the main run output directory as the base
-                ppo_log_path = output_dir / f"tensorboard_logs_{symbol}"
-                fit_kwargs["tensorboard_log_path"] = str(ppo_log_path)  # Pass as string
-                # ---
-
-                # Log selected features
-                logger.info(
-                    f"Selected {len(lstm_ppo_features)} features for LSTM-PPO model: "
-                    f"{', '.join(lstm_ppo_features[:5])}..."
-                )
-
-                # Save selected features for reference
-                with open(output_dir / f"lstm_ppo_features_{symbol}.json", "w") as f:
-                    json.dump(lstm_ppo_features, f, indent=2)
-
-            # Handle xlstm_ppo model if it's in the models
-            if "xlstm_ppo" in model_names:
-                # Use the same parameters as lstm_ppo
-                fit_kwargs["xlstm_ppo_timesteps"] = args.rl_timesteps
-                fit_kwargs["xlstm_ppo_checkpoint_freq"] = args.checkpoint_freq
-
-                # Set device for RL model
-                if args.gpu:
-                    fit_kwargs["xlstm_ppo_device"] = "cuda" if gpu_available else "cpu"
-                else:
-                    fit_kwargs["xlstm_ppo_device"] = "cpu"
-
-                # Use the same feature selection as lstm_ppo
-                if "lstm_ppo_features" not in fit_kwargs:
-                    xlstm_ppo_features = select_rl_features(X_train)
-                    fit_kwargs["xlstm_ppo_features"] = xlstm_ppo_features
-                else:
-                    fit_kwargs["xlstm_ppo_features"] = fit_kwargs["lstm_ppo_features"]
-
-                # Pass original close price needed for fitting/environment
-                fit_kwargs["xlstm_ppo_X_train_with_close"] = train_df
-
-                # Pass symbol-specific TensorBoard path
-                xlstm_ppo_log_path = output_dir / f"xlstm_tensorboard_logs_{symbol}"
-                fit_kwargs["xlstm_ppo_tensorboard_log_path"] = str(xlstm_ppo_log_path)
-
-                # Log selected features
-                logger.info(
-                    f"Selected {len(fit_kwargs['xlstm_ppo_features'])} features for xLSTM-PPO model: "
-                    f"{', '.join(fit_kwargs['xlstm_ppo_features'][:5])}..."
-                )
-
-                # Save selected features for reference
-                with open(output_dir / f"xlstm_ppo_features_{symbol}.json", "w") as f:
-                    json.dump(fit_kwargs["xlstm_ppo_features"], f, indent=2)
-
-            # Handle xlstm_grpo model if it's in the models
-            if "xlstm_grpo" in model_names:
-                # Set GRPO training parameters
-                fit_kwargs["xlstm_grpo_updates"] = args.rl_timesteps // 100  # Fewer updates for GRPO
-
-                # Set device for RL model
-                if args.gpu:
-                    fit_kwargs["xlstm_grpo_device"] = "cuda" if gpu_available else "cpu"
-                else:
-                    fit_kwargs["xlstm_grpo_device"] = "cpu"
-
-                # Use the same feature selection as lstm_ppo
-                if "lstm_ppo_features" not in fit_kwargs and "xlstm_ppo_features" not in fit_kwargs:
-                    xlstm_grpo_features = select_rl_features(X_train)
-                    fit_kwargs["xlstm_grpo_features"] = xlstm_grpo_features
-                elif "lstm_ppo_features" in fit_kwargs:
-                    fit_kwargs["xlstm_grpo_features"] = fit_kwargs["lstm_ppo_features"]
-                else:
-                    fit_kwargs["xlstm_grpo_features"] = fit_kwargs["xlstm_ppo_features"]
-
-                # Pass original close price needed for fitting/environment
-                fit_kwargs["xlstm_grpo_X_train_with_close"] = train_df
-
-                # Pass symbol-specific TensorBoard path
-                xlstm_grpo_log_path = output_dir / f"xlstm_grpo_logs_{symbol}"
-                fit_kwargs["xlstm_grpo_log_path"] = str(xlstm_grpo_log_path)
-
-                # Log selected features
-                logger.info(
-                    f"Selected {len(fit_kwargs['xlstm_grpo_features'])} features for xLSTM-GRPO model: "
-                    f"{', '.join(fit_kwargs['xlstm_grpo_features'][:5])}..."
-                )
-
-                # Save selected features for reference
-                with open(output_dir / f"xlstm_grpo_features_{symbol}.json", "w") as f:
-                    json.dump(fit_kwargs["xlstm_grpo_features"], f, indent=2)
-
-            ensemble.fit(X_train, y_train, **fit_kwargs)
-        except Exception as e:
-            logger.error(f"Error training ensemble for {symbol}: {e}", exc_info=True)
-            continue
-
-        # Evaluate on test data
-        logger.info(f"Evaluating ensemble for {symbol}")
-        metrics = ensemble.evaluate(X_test, y_test)
-        all_run_metrics[symbol] = metrics  # Store metrics for this symbol
-
-        logger.info(f"Test metrics for {symbol}: {metrics}")
-
-        # Get model contributions
-        contributions = ensemble.get_model_contributions(X_test.iloc[:5])
-        logger.info(f"Model contributions for {symbol}:\n{contributions}")
-
-        # --- Save individual symbol results to the run directory ---
-        symbol_results_path = output_dir / f"results_{symbol}.json"
-        # No need to create parent dir, output_dir already exists
-        with open(symbol_results_path, "w") as f:
-            json.dump(
-                {
-                    "symbol": symbol,
-                    "metrics": metrics,
-                    "weights": {k: float(v) for k, v in ensemble.weights.items()},
-                    "timestamp": timestamp,  # Keep original run timestamp
-                },
-                f,
-                indent=2,
-            )
-        logger.info(f"Saved evaluation results for {symbol} to {symbol_results_path}")
-        # ---
-
-    # --- Save the final ensemble model to the run directory ---
-    logger.info("Saving ensemble model state")
-    ensemble_save_path = output_dir / "ensemble_model"  # Pass a sub-directory
-    ensemble.save(directory=ensemble_save_path)  # Pass the dedicated directory
-    logger.info(f"Ensemble model state saved to {ensemble_save_path}")
-    # ---
-
-    # --- Save training configuration ---
-    config_path = output_dir / "training_config.json"
-    with open(config_path, "w") as f:
-        # Convert training config to dict for JSON serialization
-        config_dict = {
-            "symbols": symbols,
+    with mlflow.start_run(
+        experiment_id=experiment_id, run_name=f"training_{timestamp}",
+    ):
+        log_params_safe({
+            "symbols": ",".join(symbols),
             "timeframe": args.timeframe,
             "start_date": args.start_date,
             "end_date": args.end_date,
             "horizon": args.horizon,
             "use_sentiment": args.use_sentiment,
-            "models": model_names,
+            "models": ",".join(model_names),
+            "n_splits": training_config.n_splits,
+            "purge_horizon": training_config.effective_purge_horizon,
+            "embargo_pct": training_config.embargo_pct,
+            "expanding": training_config.expanding,
             "rl_timesteps": args.rl_timesteps,
             "gpu": args.gpu,
-            "timestamp": timestamp,
-        }
-        json.dump(config_dict, f, indent=2)
-    # ---
+            "output_dir": str(output_dir.resolve()),
+        })
 
-    # --- Optionally, save aggregated metrics for the whole run ---
-    aggregated_results_path = output_dir / "aggregated_results.json"
-    with open(aggregated_results_path, "w") as f:
-        # Convert numpy values to Python natives for JSON serialization
-        serializable_metrics = {}
-        for symbol, metrics in all_run_metrics.items():
-            serializable_metrics[symbol] = {k: float(v) for k, v in metrics.items()}
-        json.dump(serializable_metrics, f, indent=2)
-    logger.info(f"Saved aggregated evaluation results to {aggregated_results_path}")
-    # ---
+        run_summary: Dict[str, Any] = {}
+        for symbol, full_df in enhanced_data.items():
+            symbol_dir = output_dir / symbol
+            symbol_dir.mkdir(parents=True, exist_ok=True)
+
+            with mlflow.start_run(run_name=symbol, nested=True):
+                per_fold_metrics = train_symbol_wfo(
+                    symbol=symbol,
+                    full_df=full_df,
+                    target_col=target_col,
+                    splitter=splitter,
+                    model_configs=model_configs,
+                    model_names=model_names,
+                    training_config=training_config,
+                    args=args,
+                    gpu_available=gpu_available,
+                    feature_engineer=feature_engineer,
+                    symbol_dir=symbol_dir,
+                )
+                log_artifact_dir(symbol_dir)
+                run_summary[symbol] = {
+                    "n_folds_fit": len(per_fold_metrics),
+                }
+
+        # Save the training config + run summary for the backtest WFO loop.
+        config_path = output_dir / "training_config.json"
+        with open(config_path, "w") as f:
+            json.dump(
+                {
+                    **asdict(training_config),
+                    "models": model_names,
+                    "rl_timesteps": args.rl_timesteps,
+                    "gpu": args.gpu,
+                    "timestamp": timestamp,
+                    "experiment": args.experiment,
+                    "run_summary": run_summary,
+                },
+                f, indent=2, default=str,
+            )
 
     logger.info("Training complete")
 

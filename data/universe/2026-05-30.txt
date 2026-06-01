@@ -1,0 +1,12 @@
+# Point-in-time universe — symbols investable as of this date (the filename).
+# One symbol per line; '#' starts a comment; blank lines ignored.
+# Used via:  python -m scripts.training --universe data/universe/2026-05-30.txt
+# Combine with --universe_asof 2026-05-30 to drop names with no data by then.
+#
+# NOTE (survivorship): this file lists names that EXIST as of the date. It
+# does not recover delisted/acquired tickers — true survivorship-bias-free
+# construction needs a delisting database (CRSP / Norgate). See README.
+AAPL
+MSFT
+GOOG
+AMZN

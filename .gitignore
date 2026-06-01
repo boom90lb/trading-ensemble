@@ -127,9 +127,18 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# MLflow tracking store (file backend ./mlruns + the sqlite migration target)
+mlflow.db
+mlflow.db-journal
+mlruns/
+
 # Models, Data, and Runs
 /models/
-data/
+# ignore data/ contents (cache parquets) but DO track point-in-time universe
+# files (Phase 4 §4.3) — a parent dir excluded as `data/` can't be re-included
+# per-subpath, so ignore the contents and negate the universe subdir.
+data/*
+!data/universe/
 runs/
 tensorboard_logs/
 

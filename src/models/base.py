@@ -30,6 +30,18 @@ class BaseModel(ABC):
         self.is_fitted = False
         self.feature_names: List[str] = []
 
+    @property
+    def required_history(self) -> int:
+        """Number of trailing rows ``predict`` needs to score the latest bar.
+
+        Point models (ARIMA/Prophet/XGBoost) score from a single row → 1.
+        Windowed/sequence models (LSTM, the RL agents) need a lookback window
+        and override this. The trading loop feeds ``predict`` the trailing
+        ``required_history`` rows and reads the LAST predicted position as the
+        current-bar decision. Default 1 keeps point models unchanged.
+        """
+        return 1
+
     @abstractmethod
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series, **kwargs) -> "BaseModel":
         """Fit the model to training data.

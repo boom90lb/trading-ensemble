@@ -177,12 +177,12 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
         # Prepare input features
         X = df_with_features.copy()
 
-        # Make predictions
+        # Make predictions. After Phase 1.2, ensemble.predict returns positions
+        # in [-1, 1] rather than predicted prices.
         try:
             predictions = model.predict(X)
 
-            # Create results DataFrame
-            results = pd.DataFrame({"date": X.index, "close": X["close"], "predicted": predictions})
+            results = pd.DataFrame({"date": X.index, "close": X["close"], "position": predictions})
 
             # Calculate forecast horizons
             forecast_dates = []
@@ -217,29 +217,27 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
                         # In production, consider more sophisticated forecasting
                         forecast_signals.append(trading_signals[-1])
 
-            # Create forecast DataFrame
-            forecast = pd.DataFrame({"date": forecast_dates, "close": np.nan, "predicted": np.nan})
+            # Phase 1.4 (B4 resolution): the prior random-walk extrapolation was
+            # nonsense for prices and stayed nonsense after Phase 1.2 mapped
+            # ensemble outputs into position space. An honest multi-step
+            # position forecast requires simulating future OHLCV trajectories
+            # (positions are derived from features that are derived from prices)
+            # — out of scope for this prediction script. predictions[-1] is the
+            # model's recommendation given the latest available bar; hold it
+            # flat across the horizon as the baseline. Calling predict() on a
+            # single-row slice is also avoided because sequence members (LSTM,
+            # RL window envs) require sequence_length rows and silently return
+            # empty otherwise.
+            last_position = float(predictions[-1]) if len(predictions) else 0.0
+            forecast_positions = [last_position] * horizon
 
-            # Generate forecast
-            last_price = X["close"].iloc[-1]
-            forecast_prices = []
-
-            # Simple forecasting - in production would use ensemble model directly
-            for i in range(horizon):
-                if i == 0:
-                    # First day forecast
-                    next_price = model.predict(X.iloc[[-1]])
-                    if len(next_price) > 0:
-                        forecast_prices.append(next_price[0])
-                    else:
-                        forecast_prices.append(last_price)
-                else:
-                    # Create synthetic features for future dates
-                    # This is simplified - in production would be more sophisticated
-                    next_price = forecast_prices[-1] * (1 + np.random.normal(0, 0.005))
-                    forecast_prices.append(next_price)
-
-            forecast["predicted"] = forecast_prices
+            forecast = pd.DataFrame(
+                {
+                    "date": forecast_dates,
+                    "close": np.nan,
+                    "position": np.clip(forecast_positions, -1.0, 1.0),
+                }
+            )
 
             # Combine results and forecast
             combined = pd.concat([results, forecast])
@@ -247,33 +245,31 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
             # Store predictions
             all_predictions[symbol] = combined
 
-            # Plot if requested
             if plot:
-                plt.figure(figsize=(12, 6))
-                plt.plot(results["date"], results["close"], label="Actual")
-                plt.plot(combined["date"], combined["predicted"], label="Predicted", linestyle="--")
+                fig, (ax_price, ax_pos) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+                ax_price.plot(results["date"], results["close"], label="Close")
+                ax_price.set_ylabel("Price")
+                ax_price.grid(True)
+                ax_price.legend()
 
-                # Mark forecast section
-                plt.axvline(x=results["date"].iloc[-1], color="r", linestyle="-", alpha=0.3)
-                plt.fill_between(
-                    forecast["date"], forecast["predicted"] * 0.95, forecast["predicted"] * 1.05, color="r", alpha=0.2
-                )
+                ax_pos.plot(combined["date"], combined["position"], label="Ensemble position", linestyle="--")
+                ax_pos.axhline(0, color="grey", linewidth=0.5)
+                ax_pos.axvline(x=results["date"].iloc[-1], color="r", linestyle="-", alpha=0.3)
+                ax_pos.set_ylabel("Position")
+                ax_pos.set_xlabel("Date")
+                ax_pos.set_ylim(-1.05, 1.05)
+                ax_pos.grid(True)
+                ax_pos.legend()
+                fig.suptitle(f"{symbol} — position forecast (horizon: {horizon} bars)")
 
-                plt.title(f"{symbol} Price Prediction (Horizon: {horizon} days)")
-                plt.xlabel("Date")
-                plt.ylabel("Price")
-                plt.legend()
-                plt.grid(True)
-
-                # Save plot
                 plt_path = RESULTS_DIR / f"prediction_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                plt.savefig(plt_path)
-                plt.close()
+                fig.savefig(plt_path)
+                plt.close(fig)
 
-            # Print summary
+            last_close = float(X["close"].iloc[-1])
             logger.info(f"Prediction summary for {symbol}:")
-            logger.info(f"Current price: ${last_price:.2f}")
-            logger.info(f"Predicted prices (next {horizon} days): {[f'${p:.2f}' for p in forecast_prices]}")
+            logger.info(f"Current price: ${last_close:.2f}")
+            logger.info(f"Forecast positions (next {horizon} bars): {[f'{p:+.3f}' for p in forecast_positions]}")
 
             if "lstm_ppo" in model.models and len(trading_signals) > 0:
                 logger.info(f"Current trading signal: {results['signal'].iloc[-1]}")

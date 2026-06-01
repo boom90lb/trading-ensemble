@@ -1,5 +1,11 @@
 # src/models/ensemble.py
-"""Ensemble model implementation for time series forecasting."""
+"""Ensemble model. Emits unified position outputs in [-1, 1].
+
+Forecast members (ARIMA, Prophet, LSTM, XGBoost) produce ŷ_{t+h}; policy
+members (LSTM-PPO, xLSTM-PPO, xLSTM-GRPO) produce positions directly.
+Forecast outputs are mapped through inverse-volatility sizing before
+weighting so the ensemble averages dimensionally coherent quantities (B8).
+"""
 
 import logging
 import pickle
@@ -8,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize  # type: ignore
 from sklearn.metrics import (  # type: ignore
     mean_absolute_error,
     mean_squared_error,
@@ -15,8 +22,12 @@ from sklearn.metrics import (  # type: ignore
 )
 
 from src.config import MODELS_DIR, EnsembleConfig
+from src.conformal import ACIState, EnbPICalibrator
 from src.models.base import BaseModel
 from src.models.lstm_ppo import LSTMPPO
+from src.models.mapping import forecast_to_position, ideal_position, realized_vol
+from src.models.registry import ModelKind, is_forecast, is_policy, model_kind
+from src.validation.walk_forward import PurgedWalkForward
 
 logger = logging.getLogger(__name__)
 
@@ -37,29 +48,63 @@ class EnsembleModel(BaseModel):
         # Store configuration
         self.config = config or EnsembleConfig(models=[])
 
-        # Initialize model components
-        self.models: Dict[str, BaseModel] = {}  # Dictionary of {model_name: model_instance}
-        self.weights: Dict[str, float] = {}  # Dictionary of {model_name: weight}
-        self.errors: Dict[str, float] = {}  # Dictionary of {model_name: error_metric}
+        self.models: Dict[str, BaseModel] = {}
+        self.weights: Dict[str, float] = {}
+        self.errors: Dict[str, float] = {}
+        self.kinds: Dict[str, ModelKind] = {}
         self.is_fitted = False
 
-        # Store paths for RL models
-        self.lstm_ppo_save_path: Optional[Path] = None  # Store path for LSTMPPO
-        self.xlstm_ppo_save_path: Optional[Path] = None  # Store path for XLSTMPPOAgent
-        self.xlstm_grpo_save_path: Optional[Path] = None  # Store path for XLSTMGRPOAgent
+        # Vol-targeting and meta-learner knobs. Held as attrs so they can be
+        # overridden after construction without re-instantiating the ensemble.
+        self.vol_window: int = 20
+        self.vol_floor: float = 5e-3
+        # Read vol-targeting knobs from config (Phase 2.7) so a sweep can vary
+        # them; default to 1.0 when the config predates these fields.
+        self.target_vol: float = getattr(self.config, "target_vol", 1.0)
+        self.position_cap: float = getattr(self.config, "position_cap", 1.0)
+        # Phase 2.1: PurgedWalkForward params for meta-learner OOF.
+        # Used for both forecast members (was sklearn KFold) and policy
+        # members (was in-sample-leaky train-tail holdout via
+        # meta_policy_holdout, now retired).
+        self.meta_cv_folds: int = 3
+        self.meta_embargo_pct: float = 0.01
 
-        # Initialize models and weights from config
+        # Phase 2.5: position-level conformal layer over OOF residuals.
+        # Populated by fit() when a meta-learner is configured (dynamic
+        # weighting). predict_band() falls back to ±position_cap bands when
+        # conformal is None (e.g. static-weighted ensembles).
+        self.conformal_alpha_target: float = 0.10
+        self.conformal_aci_gamma: float = 0.01
+        self.conformal: Optional[EnbPICalibrator] = None
+        self.aci: Optional[ACIState] = None
+
+        self.lstm_ppo_save_path: Optional[Path] = None
+        self.xlstm_ppo_save_path: Optional[Path] = None
+        self.xlstm_grpo_save_path: Optional[Path] = None
+
         for model_config in self.config.models:
             if model_config.enabled:
                 model_instance = self._create_model(model_config.name)
                 if model_instance:
                     self.models[model_config.name] = model_instance
                     self.weights[model_config.name] = model_config.weight
+                    self.kinds[model_config.name] = model_kind(model_config.name)
                 else:
                     logger.warning(f"Failed to create model '{model_config.name}', excluding from ensemble.")
 
-        # Normalize weights
         self._normalize_weights()
+
+    @property
+    def required_history(self) -> int:
+        """Max trailing rows any member needs to score the latest bar.
+
+        The ensemble must be fed enough history for its hungriest member
+        (e.g. an RL agent's window_size+2), so the trading loop slices the
+        trailing ``required_history`` rows. Point-only ensembles → 1.
+        """
+        if not self.models:
+            return 1
+        return max(m.required_history for m in self.models.values())
 
     def _normalize_weights(self) -> None:
         """Normalize model weights to sum to 1."""
@@ -71,11 +116,17 @@ class EnsembleModel(BaseModel):
             for key in self.weights:
                 self.weights[key] /= total_weight
 
-    def _create_model(self, model_name: str) -> Optional[BaseModel]:
+    def _create_model(self, model_name: str, seed: Optional[int] = None) -> Optional[BaseModel]:
         """Create a model instance by name.
 
         Args:
             model_name: Name of the model to create
+            seed: Optional PRNG seed for policy (RL) members. When ``None``
+                (the default, used by the production fit + OOF refit paths) the
+                agent's own constructor default applies — no behavior change.
+                The multi-seed eval driver (Phase 3.2) passes an explicit seed
+                so each RL agent's ``jax.random.key(seed)`` differs per trial.
+                Ignored by forecast members, which are deterministic given data.
 
         Returns:
             Model instance or None if not supported
@@ -99,17 +150,20 @@ class EnsembleModel(BaseModel):
                 return XGBoostModel(target_column=self.target_column, horizon=self.horizon)
             elif model_name == "lstm_ppo":
                 # LSTM-PPO is now created directly
-                return LSTMPPO(target_column=self.target_column, horizon=self.horizon)
+                policy_kwargs = {"seed": seed} if seed is not None else {}
+                return LSTMPPO(target_column=self.target_column, horizon=self.horizon, **policy_kwargs)
             elif model_name == "xlstm_ppo":
                 # Import the XLSTMPPOAgent model
                 from src.models.xlstm_ppo import XLSTMPPOAgent
 
-                return XLSTMPPOAgent(target_column=self.target_column, horizon=self.horizon)
+                policy_kwargs = {"seed": seed} if seed is not None else {}
+                return XLSTMPPOAgent(target_column=self.target_column, horizon=self.horizon, **policy_kwargs)
             elif model_name == "xlstm_grpo":
                 # Import the XLSTMGRPOAgent model
                 from src.models.xlstm_grpo import XLSTMGRPOAgent
 
-                return XLSTMGRPOAgent(target_column=self.target_column, horizon=self.horizon)
+                policy_kwargs = {"seed": seed} if seed is not None else {}
+                return XLSTMGRPOAgent(target_column=self.target_column, horizon=self.horizon, **policy_kwargs)
             else:
                 logger.warning(f"Unsupported model: {model_name}")
                 return None
@@ -119,6 +173,59 @@ class EnsembleModel(BaseModel):
         except Exception as e:
             logger.error(f"Error creating {model_name} model: {e}")
             return None
+
+    def _fit_policy_member(
+        self,
+        name: str,
+        model: BaseModel,
+        X_with_close: pd.DataFrame,
+        y: pd.Series,
+        kwargs: Dict[str, Any],
+        persist: bool,
+    ) -> bool:
+        """Fit one policy member. Centralizes the per-policy dispatch so
+        the OOF refit (Phase 2.1) and the top-level fit share one code
+        path. `persist=True` writes the model's save artifact and stashes
+        the path on self; OOF folds set persist=False.
+        """
+        features = kwargs.get(f"{name}_features")
+        if features is None:
+            logger.error(f"Missing '{name}_features' kwarg; skipping {name}.")
+            return False
+        model.features = features  # type: ignore[attr-defined]
+
+        if name == "lstm_ppo":
+            timesteps = kwargs.get("lstm_ppo_timesteps", 100000)
+            if not isinstance(model, LSTMPPO):
+                logger.error(f"{name} model is not an LSTMPPO instance.")
+                return False
+            model.fit(X_with_close, y, total_timesteps=timesteps)
+            if persist:
+                self.lstm_ppo_save_path = model.save()
+        elif name == "xlstm_ppo":
+            from src.models.xlstm_ppo import XLSTMPPOAgent
+
+            timesteps = kwargs.get("xlstm_ppo_timesteps", 100000)
+            if not isinstance(model, XLSTMPPOAgent):
+                logger.error(f"{name} model is not an XLSTMPPOAgent instance.")
+                return False
+            model.fit(X_with_close, y, total_timesteps=timesteps)
+            if persist:
+                self.xlstm_ppo_save_path = model.save()
+        elif name == "xlstm_grpo":
+            from src.models.xlstm_grpo import XLSTMGRPOAgent
+
+            updates = kwargs.get("xlstm_grpo_updates", 1000)
+            if not isinstance(model, XLSTMGRPOAgent):
+                logger.error(f"{name} model is not an XLSTMGRPOAgent instance.")
+                return False
+            model.fit(X_with_close, y, total_updates=updates)
+            if persist:
+                self.xlstm_grpo_save_path = model.save()
+        else:
+            logger.error(f"Unknown policy member '{name}' in dispatch.")
+            return False
+        return True
 
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series, **kwargs) -> "EnsembleModel":
         """Fit the ensemble model by fitting each component model.
@@ -134,105 +241,28 @@ class EnsembleModel(BaseModel):
         """
         fitted_models: List[str] = []
 
-        # Fit each enabled model
         for name, model in self.models.items():
             try:
                 logger.info(f"Fitting {name} model")
-                if name == "lstm_ppo":
-                    # Special handling for LSTM-PPO
-                    lstm_ppo_timesteps = kwargs.get("lstm_ppo_timesteps", 100000)
-                    lstm_ppo_features = kwargs.get("lstm_ppo_features")
-                    lstm_ppo_X_train_with_close = kwargs.get("lstm_ppo_X_train_with_close")
-
-                    if lstm_ppo_features is None or lstm_ppo_X_train_with_close is None:
+                if is_policy(name):
+                    x_full = kwargs.get(f"{name}_X_train_with_close")
+                    if x_full is None:
                         logger.error(
-                            "Missing required arguments for LSTMPPO fitting: "
-                            "'lstm_ppo_features' or 'lstm_ppo_X_train_with_close'"
+                            f"Missing '{name}_X_train_with_close' kwarg; skipping {name}."
                         )
                         continue
-
-                    # Ensure model is LSTMPPO type for static analysis
-                    if isinstance(model, LSTMPPO):
-                        # Prepare data (select features, ensure close price is present)
-                        model.features = lstm_ppo_features
-                        # LSTMPPO fit method expects DataFrame with features + close price
-                        model.fit(lstm_ppo_X_train_with_close, y_train, total_timesteps=lstm_ppo_timesteps)
-                        # Save LSTM-PPO separately immediately after fitting and store its path
-                        save_path = model.save()
-                        self.lstm_ppo_save_path = save_path
-                    else:
-                        logger.error(f"Model {name} is not an instance of LSTMPPO as expected.")
-                        continue
-
-                elif name == "xlstm_ppo":
-                    # Special handling for xLSTM-PPO
-                    xlstm_ppo_timesteps = kwargs.get("xlstm_ppo_timesteps", 100000)
-                    xlstm_ppo_features = kwargs.get("xlstm_ppo_features")
-                    xlstm_ppo_X_train_with_close = kwargs.get("xlstm_ppo_X_train_with_close")
-
-                    if xlstm_ppo_features is None or xlstm_ppo_X_train_with_close is None:
-                        logger.error(
-                            "Missing required arguments for XLSTMPPOAgent fitting: "
-                            "'xlstm_ppo_features' or 'xlstm_ppo_X_train_with_close'"
-                        )
-                        continue
-
-                    # Ensure model is XLSTMPPOAgent type
-                    from src.models.xlstm_ppo import XLSTMPPOAgent
-
-                    if isinstance(model, XLSTMPPOAgent):
-                        # Prepare data (select features, ensure close price is present)
-                        model.features = xlstm_ppo_features
-                        # XLSTMPPOAgent fit method expects DataFrame with features + close price
-                        model.fit(xlstm_ppo_X_train_with_close, y_train, total_timesteps=xlstm_ppo_timesteps)
-                        # Save xLSTM-PPO separately immediately after fitting and store its path
-                        save_path = model.save()
-                        self.xlstm_ppo_save_path = save_path
-                    else:
-                        logger.error(f"Model {name} is not an instance of XLSTMPPOAgent as expected.")
-                        continue
-
-                elif name == "xlstm_grpo":
-                    # Special handling for xLSTM-GRPO
-                    xlstm_grpo_updates = kwargs.get("xlstm_grpo_updates", 1000)
-                    xlstm_grpo_features = kwargs.get("xlstm_grpo_features")
-                    xlstm_grpo_X_train_with_close = kwargs.get("xlstm_grpo_X_train_with_close")
-
-                    if xlstm_grpo_features is None or xlstm_grpo_X_train_with_close is None:
-                        logger.error(
-                            "Missing required arguments for XLSTMGRPOAgent fitting: "
-                            "'xlstm_grpo_features' or 'xlstm_grpo_X_train_with_close'"
-                        )
-                        continue
-
-                    # Ensure model is XLSTMGRPOAgent type
-                    from src.models.xlstm_grpo import XLSTMGRPOAgent
-
-                    if isinstance(model, XLSTMGRPOAgent):
-                        # Prepare data (select features, ensure close price is present)
-                        model.features = xlstm_grpo_features
-                        # XLSTMGRPOAgent fit method expects DataFrame with features + close price
-                        model.fit(xlstm_grpo_X_train_with_close, y_train, total_updates=xlstm_grpo_updates)
-                        # Save xLSTM-GRPO separately immediately after fitting and store its path
-                        save_path = model.save()
-                        self.xlstm_grpo_save_path = save_path
-                    else:
-                        logger.error(f"Model {name} is not an instance of XLSTMGRPOAgent as expected.")
+                    if not self._fit_policy_member(name, model, x_full, y_train, kwargs, persist=True):
                         continue
                 else:
-                    # Standard fitting for other models
-                    # Pass only relevant kwargs if needed, or none
-                    model.fit(X_train, y_train)  # Assuming other models don't need specific kwargs from this level
+                    model.fit(X_train, y_train)
 
                 fitted_models.append(name)
             except Exception as e:
-                logger.error(f"Error fitting {name} model: {e}", exc_info=True)  # Log traceback
+                logger.error(f"Error fitting {name} model: {e}", exc_info=True)
 
-        # Update weights based on fitted models
         if self.config.weighting_strategy == "dynamic":
-            self._update_weights_dynamic(X_train, y_train, fitted_models)
+            self._fit_meta_learner_weights(X_train, y_train, fitted_models, kwargs)
 
-        # Normalize weights
         self._normalize_weights()
 
         self.is_fitted = len(fitted_models) > 0
@@ -241,200 +271,435 @@ class EnsembleModel(BaseModel):
 
         return self
 
-    def _update_weights_dynamic(self, X: pd.DataFrame, y: pd.Series, model_names: List[str]) -> None:
-        """Update model weights based on validation performance.
+    def _fit_meta_learner_weights(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        model_names: List[str],
+        fit_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Replace inverse-MAE-on-train weighting (B5) with a constrained
+        meta-learner fit to OOF positions vs. ideal positions.
 
-        Args:
-            X: Validation features
-            y: Validation targets
-            model_names: List of fitted model names
+        Phase 2.1: both forecast and policy members produce OOF via
+        PurgedWalkForward (k refits each). Policy refits need the original
+        fit_kwargs so we can re-pass features and per-fold sliced
+        X_train_with_close.
         """
-        self.errors = {}
+        if self.target_column not in X.columns:
+            logger.warning(
+                f"Meta-learner needs '{self.target_column}' in X to compute realized vol; "
+                "skipping dynamic re-weighting."
+            )
+            return
 
-        # Calculate errors for each model
+        oof = self._compute_oof_positions(X, y, model_names, fit_kwargs or {})
+        if not oof:
+            logger.warning("No OOF positions computed; keeping config weights.")
+            return
+
+        idx = next(iter(oof.values())).index
+        members = list(oof.keys())
+        for name in members[1:]:
+            idx = idx.intersection(oof[name].index)
+        if len(idx) < 5:
+            logger.warning(f"Only {len(idx)} overlapping OOF rows; keeping config weights.")
+            return
+
+        close = X.loc[idx, self.target_column]
+        sigma = realized_vol(close, window=self.vol_window, vol_floor=self.vol_floor)
+        realized_ret = close.pct_change(self.horizon).shift(-self.horizon).to_numpy()
+        y_ideal = ideal_position(
+            np.nan_to_num(realized_ret, nan=0.0),
+            sigma,
+            target_vol=self.target_vol,
+            cap=self.position_cap,
+        )
+
+        valid = np.isfinite(realized_ret)
+        if valid.sum() < 5:
+            logger.warning("Too few finite realized-return rows for meta-learner; keeping config weights.")
+            return
+
+        P = np.column_stack([oof[name].loc[idx].to_numpy() for name in members])[valid]
+        target = y_ideal[valid]
+
+        w0 = np.full(len(members), 1.0 / len(members))
+        result = minimize(
+            lambda w: float(np.mean((target - P @ w) ** 2)),
+            w0,
+            method="SLSQP",
+            bounds=[(0.0, 1.0)] * len(members),
+            constraints=[{"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)}],
+            options={"ftol": 1e-9, "maxiter": 200},
+        )
+        if not result.success:
+            logger.warning(f"Meta-learner SLSQP did not converge ({result.message}); keeping config weights.")
+            return
+
+        for name, w in zip(members, result.x):
+            self.weights[name] = float(w)
+        self.errors = {
+            name: float(np.mean(np.abs(target - oof[name].loc[idx].to_numpy()[valid])))
+            for name in members
+        }
+        logger.info(f"Meta-learner weights: {self.weights}")
+
+        # Phase 2.5: fit position-level conformal calibrator on the same OOF
+        # residuals the meta-learner just regressed against. The blended OOF
+        # uses the freshly-fit weights so the calibration matches inference
+        # behavior of predict().
+        try:
+            w_arr = np.array([self.weights[n] for n in members], dtype=np.float64)
+            blended_oof = P @ w_arr
+            blended_oof = np.clip(blended_oof, -self.position_cap, self.position_cap)
+            self.conformal = EnbPICalibrator().fit(
+                oof_predictions=blended_oof,
+                targets=target,
+                position_cap=self.position_cap,
+            )
+            self.aci = ACIState(
+                alpha_target=self.conformal_alpha_target,
+                gamma=self.conformal_aci_gamma,
+                alpha_t=self.conformal_alpha_target,
+            )
+            logger.info(
+                f"Conformal calibrator fit on {len(target)} OOF residuals "
+                f"(alpha_target={self.conformal_alpha_target}, gamma={self.conformal_aci_gamma})."
+            )
+        except ValueError as e:
+            logger.warning(f"Conformal calibration skipped ({e}); predict_band will fall back to max bands.")
+            self.conformal = None
+            self.aci = None
+
+    def _compute_oof_positions(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        model_names: List[str],
+        fit_kwargs: Dict[str, Any],
+    ) -> Dict[str, pd.Series]:
+        """Produce per-model OOF position vectors aligned to X.index.
+
+        Phase 2.1: every member is OOF'd via PurgedWalkForward. Forecast
+        members refit cheaply per fold; policy members refit too (the old
+        train-tail-holdout shortcut was in-sample-leaky because the same
+        model was already trained on those rows). Caller is on the hook
+        for the n_splits × RL-fit cost — keep `meta_cv_folds` modest.
+        """
+        oof: Dict[str, pd.Series] = {}
+        if self.target_column not in X.columns:
+            return oof
+
+        try:
+            splitter = PurgedWalkForward(
+                n_splits=self.meta_cv_folds,
+                purge_horizon=self.horizon,
+                embargo_pct=self.meta_embargo_pct,
+                expanding=True,
+            )
+            folds = list(splitter.split(X))
+        except ValueError as e:
+            logger.warning(f"PurgedWalkForward setup failed ({e}); skipping OOF.")
+            return oof
+        if not folds:
+            logger.warning("PurgedWalkForward yielded no folds; skipping OOF.")
+            return oof
+
+        close_arr = X[self.target_column].to_numpy()
+        sigma_full = realized_vol(
+            X[self.target_column],
+            window=self.vol_window,
+            vol_floor=self.vol_floor,
+        )
+
         for name in model_names:
             if name not in self.models:
                 continue
-            model = self.models[name]
             try:
-                predictions = model.predict(X)
-
-                # Calculate error metrics
-                if len(predictions) > 0 and len(y) == len(predictions):
-                    mae = mean_absolute_error(y, predictions)
-                    self.errors[name] = float(mae)
-                else:
-                    logger.warning(f"Prediction length mismatch for {name}. Skipping error calculation.")
-
+                if is_forecast(name):
+                    oof[name] = self._oof_forecast(
+                        name, X, y, close_arr, sigma_full, folds
+                    )
+                elif is_policy(name):
+                    oof[name] = self._oof_policy(name, X, y, fit_kwargs, folds)
             except Exception as e:
-                logger.error(f"Error evaluating {name} model: {e}")
+                logger.error(
+                    f"OOF generation failed for {name}: {e}", exc_info=True
+                )
+        return oof
 
-        # Update weights based on inverse error
-        if self.errors:
-            for name in model_names:
-                if name in self.errors and self.errors[name] > 0:
-                    # Inverse error weighting
-                    self.weights[name] = 1.0 / self.errors[name]  # type: ignore
-                else:
-                    # If error is zero or not available, use default weight or previous weight
-                    # Ensure the key exists before accessing it
-                    if name not in self.weights:
-                        self.weights[name] = 1.0
+    def _oof_forecast(
+        self,
+        name: str,
+        X: pd.DataFrame,
+        y: pd.Series,
+        close_arr: np.ndarray,
+        sigma_full: np.ndarray,
+        folds: List[tuple],
+    ) -> pd.Series:
+        out = np.full(len(X), np.nan)
+        for tr_idx, va_idx in folds:
+            fold_model = self._create_model(name)
+            if fold_model is None:
+                continue
+            fold_model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+            preds = fold_model.predict(X.iloc[va_idx])
+            if len(preds) != len(va_idx):
+                continue
+            out[va_idx] = forecast_to_position(
+                np.asarray(preds, dtype=np.float64),
+                close_arr[va_idx],
+                sigma_full[va_idx],
+                target_vol=self.target_vol,
+                cap=self.position_cap,
+            )
+        return pd.Series(out, index=X.index).dropna()
+
+    def _oof_policy(
+        self,
+        name: str,
+        X: pd.DataFrame,
+        y: pd.Series,
+        fit_kwargs: Dict[str, Any],
+        folds: List[tuple],
+    ) -> pd.Series:
+        """Per-fold policy refit + predict on test slice. Assumes
+        `{name}_X_train_with_close` (the unscaled OHLCV+features frame the
+        policy needs for its env) is row-aligned with X — same assumption
+        the top-level fit() makes when it passes the full frame through.
+        """
+        x_full = fit_kwargs.get(f"{name}_X_train_with_close")
+        if x_full is None:
+            logger.warning(
+                f"Policy OOF for {name} skipped: missing "
+                f"'{name}_X_train_with_close' kwarg."
+            )
+            return pd.Series(dtype=np.float64)
+        if len(x_full) != len(X):
+            logger.warning(
+                f"Policy OOF for {name} skipped: "
+                f"'{name}_X_train_with_close' has {len(x_full)} rows, "
+                f"X has {len(X)} — cannot iloc-slice consistently."
+            )
+            return pd.Series(dtype=np.float64)
+
+        out = np.full(len(X), np.nan)
+        for tr_idx, va_idx in folds:
+            fold_model = self._create_model(name)
+            if fold_model is None:
+                continue
+            ok = self._fit_policy_member(
+                name=name,
+                model=fold_model,
+                X_with_close=x_full.iloc[tr_idx],
+                y=y.iloc[tr_idx],
+                kwargs=fit_kwargs,
+                persist=False,
+            )
+            if not ok:
+                continue
+            preds = fold_model.predict(X.iloc[va_idx])
+            if len(preds) != len(va_idx):
+                logger.warning(
+                    f"Policy {name} OOF fold returned {len(preds)} preds "
+                    f"for {len(va_idx)} rows; skipping fold."
+                )
+                continue
+            out[va_idx] = np.clip(
+                np.asarray(preds, dtype=np.float64),
+                -self.position_cap,
+                self.position_cap,
+            )
+        return pd.Series(out, index=X.index).dropna()
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Generate predictions using the ensemble model.
+        """Return ensemble positions in [-1, 1].
 
-        Args:
-            X: Features
-
-        Returns:
-            Array of predictions
+        Forecast members' ŷ are mapped to positions via inverse-volatility
+        sizing against X[target_column]; policy members' outputs pass through
+        with a clip. The weighted blend lives in position space, not the
+        mixed price/position space that produced B8.
         """
         if not self.is_fitted or not self.models:
             logger.warning("Ensemble model not fitted yet")
             return np.array([])
 
-        # Get predictions from each model
-        model_predictions = {}
-        valid_model_names = []
-        for name, model in self.models.items():
-            try:
-                preds = model.predict(X)
-                if len(preds) == len(X):
-                    model_predictions[name] = preds
-                    valid_model_names.append(name)
-                elif len(preds) > 0:
-                    logger.warning(
-                        f"Prediction length mismatch for {name}. Got {len(preds)}, expected {len(X)}. Skipping."
-                    )
-                # else: prediction failed, already logged in predict method
-
-            except Exception as e:
-                logger.error(f"Error predicting with {name} model: {e}")
-
-        if not model_predictions:
-            logger.warning("No valid model predictions available")
+        positions = self._predict_positions_per_model(X)
+        if not positions:
+            logger.warning("No valid model positions available")
             return np.array([])
 
-        # Compute weighted average using only valid predictions
-        ensemble_preds = np.zeros(len(X))
+        blended = np.zeros(len(X))
         total_weight = 0.0
+        for name, pos in positions.items():
+            w = self.weights.get(name, 0.0)
+            if w <= 0:
+                continue
+            blended += w * pos
+            total_weight += w
 
-        for name in valid_model_names:
-            if name in self.weights:
-                weight = self.weights[name]
-                preds = model_predictions[name]
-                ensemble_preds += weight * preds
-                total_weight += weight
+        if total_weight == 0:
+            logger.warning("Total weight zero; falling back to equal-weight position average.")
+            blended = np.mean(np.stack(list(positions.values()), axis=0), axis=0)
+        elif not np.isclose(total_weight, 1.0):
+            blended /= total_weight
 
-        # Normalize if total weight is not 1 (and > 0)
-        if total_weight > 0 and not np.isclose(total_weight, 1.0):
-            ensemble_preds /= total_weight
-        elif total_weight == 0:
-            logger.warning("Total weight of valid models is zero. Returning unweighted average or zeros.")
-            # Fallback: simple average of available predictions or return zeros
-            if len(valid_model_names) > 0:
-                fallback_preds = np.array([model_predictions[name] for name in valid_model_names])
-                ensemble_preds = np.mean(fallback_preds, axis=0)
-            else:
-                ensemble_preds = np.zeros(len(X))  # Should not happen if model_predictions is not empty
+        return np.clip(blended, -self.position_cap, self.position_cap)
 
-        return ensemble_preds
+    def has_conformal(self) -> bool:
+        """True when fit() produced a usable conformal calibrator + ACI state."""
+        return self.conformal is not None and self.conformal.is_fitted and self.aci is not None
+
+    def predict_band(self, X: pd.DataFrame) -> tuple:
+        """Return ``(lower, point, upper)`` position-space conformal bands.
+
+        Falls back to maximally-wide bands (±position_cap) when no conformal
+        calibrator was fit — this lets downstream code call predict_band
+        unconditionally and still get a no-op interval.
+        """
+        point = self.predict(X)
+        if not self.has_conformal() or len(point) == 0:
+            lower = np.full(len(point), -self.position_cap)
+            upper = np.full(len(point), self.position_cap)
+            return lower, point, upper
+        alpha = self.aci.current_alpha()  # type: ignore[union-attr]
+        lower, upper = self.conformal.band(point, alpha=alpha)  # type: ignore[union-attr]
+        return lower, point, upper
+
+    def update_aci(self, in_band: bool) -> Optional[float]:
+        """Apply one ACI online update against an observed coverage event.
+
+        Returns the new alpha_t, or None when no conformal state exists.
+        Caller is responsible for evaluating whether the realized outcome
+        landed inside the previously-emitted band (the ensemble does not
+        track forward-horizon outcomes itself).
+        """
+        if not self.has_conformal():
+            return None
+        return self.aci.update(in_band)  # type: ignore[union-attr]
+
+    def _predict_positions_per_model(self, X: pd.DataFrame) -> Dict[str, np.ndarray]:
+        """Run each member's predict and convert to a position vector."""
+        if self.target_column not in X.columns:
+            logger.error(
+                f"Ensemble.predict requires '{self.target_column}' column in X "
+                "(needed for forecast→position vol sizing)."
+            )
+            return {}
+        close = X[self.target_column].to_numpy()
+        sigma = realized_vol(X[self.target_column], window=self.vol_window, vol_floor=self.vol_floor)
+
+        positions: Dict[str, np.ndarray] = {}
+        for name, model in self.models.items():
+            try:
+                raw = model.predict(X)
+                if len(raw) != len(X):
+                    if len(raw) > 0:
+                        logger.warning(
+                            f"{name}: predict returned {len(raw)} rows for {len(X)} input rows; skipping."
+                        )
+                    continue
+                raw_arr = np.asarray(raw, dtype=np.float64)
+                kind = self.kinds.get(name, model_kind(name))
+                if kind == "forecast":
+                    positions[name] = forecast_to_position(
+                        raw_arr, close, sigma, target_vol=self.target_vol, cap=self.position_cap
+                    )
+                else:
+                    positions[name] = np.clip(raw_arr, -self.position_cap, self.position_cap)
+            except Exception as e:
+                logger.error(f"Error predicting with {name}: {e}")
+        return positions
 
     def evaluate(self, X_test: pd.DataFrame, y_test: pd.Series) -> Dict[str, float]:
-        """Evaluate the ensemble model on test data.
+        """Evaluate ensemble positions against the ideal (perfect-foresight) bet.
 
-        Args:
-            X_test: Test features
-            y_test: Test targets
-
-        Returns:
-            Dictionary of evaluation metrics
+        The ensemble emits positions; the apples-to-apples target is the
+        ideal_position derived from realized return / realized vol. Forecast
+        members are scored on price MSE too (the quantity they actually
+        regress against); policy members are scored only in position space.
         """
         if not self.is_fitted:
             logger.warning("Ensemble model not fitted yet")
             return {}
+        if self.target_column not in X_test.columns:
+            logger.warning(
+                f"evaluate needs '{self.target_column}' in X_test for ideal-position computation."
+            )
+            return {}
 
         try:
-            # Get predictions
             y_pred = self.predict(X_test)
-
             if len(y_pred) == 0 or len(y_pred) != len(y_test):
                 logger.warning("Prediction length mismatch or no predictions available for evaluation")
                 return {}
 
-            # Calculate metrics
+            close = X_test[self.target_column].to_numpy()
+            sigma = realized_vol(X_test[self.target_column], window=self.vol_window, vol_floor=self.vol_floor)
+            realized_ret = (np.asarray(y_test, dtype=np.float64) - close) / close
+            y_ideal = ideal_position(realized_ret, sigma, target_vol=self.target_vol, cap=self.position_cap)
+
             metrics = {
-                "mae": mean_absolute_error(y_test, y_pred),
-                "mse": mean_squared_error(y_test, y_pred),
-                "rmse": np.sqrt(mean_squared_error(y_test, y_pred)),
-                "r2": r2_score(y_test, y_pred),
+                "position_mae": mean_absolute_error(y_ideal, y_pred),
+                "position_mse": mean_squared_error(y_ideal, y_pred),
+                "position_rmse": float(np.sqrt(mean_squared_error(y_ideal, y_pred))),
+                "position_r2": r2_score(y_ideal, y_pred),
             }
 
-            # Evaluate individual models for comparison
             for name, model in self.models.items():
                 try:
-                    model_preds = model.predict(X_test)
-                    if len(model_preds) == len(y_test):
-                        metrics[f"{name}_mae"] = mean_absolute_error(y_test, model_preds)
-                        metrics[f"{name}_rmse"] = np.sqrt(mean_squared_error(y_test, model_preds))
-                    elif len(model_preds) > 0:
-                        logger.warning(f"Individual model evaluation skipped for {name} due to length mismatch.")
-
+                    model_preds = np.asarray(model.predict(X_test), dtype=np.float64)
+                    if len(model_preds) != len(y_test):
+                        if len(model_preds) > 0:
+                            logger.warning(f"Individual eval skipped for {name}: length mismatch.")
+                        continue
+                    if self.kinds.get(name) == "forecast":
+                        metrics[f"{name}_price_mae"] = mean_absolute_error(y_test, model_preds)
+                        metrics[f"{name}_price_rmse"] = float(np.sqrt(mean_squared_error(y_test, model_preds)))
+                        pos = forecast_to_position(
+                            model_preds, close, sigma, target_vol=self.target_vol, cap=self.position_cap
+                        )
+                    else:
+                        pos = np.clip(model_preds, -self.position_cap, self.position_cap)
+                    metrics[f"{name}_position_mae"] = mean_absolute_error(y_ideal, pos)
                 except Exception as e:
-                    logger.error(f"Error evaluating {name} model: {e}")
+                    logger.error(f"Error evaluating {name}: {e}")
 
             return metrics
-
         except Exception as e:
-            logger.error(f"Error evaluating ensemble model: {e}")
+            logger.error(f"Error evaluating ensemble: {e}")
             return {}
 
     def get_model_contributions(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Get the contribution of each model to the ensemble prediction.
+        """Per-model positions, weights, and weighted contributions.
 
-        Args:
-            X: Features
-
-        Returns:
-            DataFrame with model contributions
+        Columns: `{name}_position`, `{name}_weight`, `{name}_contrib`, plus
+        `ensemble_position`. Forecast outputs are vol-mapped before display
+        so all `_position` columns are in the same [-1, 1] space.
         """
         if not self.is_fitted:
             logger.warning("Ensemble model not fitted yet")
             return pd.DataFrame()
 
-        # Get ensemble prediction
-        ensemble_pred = self.predict(X)
-
-        if len(ensemble_pred) != len(X):
+        ensemble_pos = self.predict(X)
+        if len(ensemble_pos) != len(X):
             logger.warning("Ensemble prediction length mismatch in get_model_contributions")
             return pd.DataFrame()
 
-        # Get individual model predictions
-        model_data = {}
-        for name, model in self.models.items():
-            try:
-                preds = model.predict(X)
-                if len(preds) == len(X):
-                    model_data[f"{name}_pred"] = preds
-                    if name in self.weights:
-                        weight = self.weights[name]
-                        model_data[f"{name}_weight"] = [weight] * len(X)  # type: ignore
-                        # Calculate weighted contribution
-                        model_data[f"{name}_contrib"] = preds * weight
-                elif len(preds) > 0:
-                    logger.warning(f"Skipping contributions for {name} due to prediction length mismatch.")
-
-            except Exception as e:
-                logger.error(f"Error getting predictions for {name} model in contributions: {e}")
-
-        # Create DataFrame
-        if model_data:
-            df = pd.DataFrame(model_data, index=X.index)
-            df["ensemble_pred"] = ensemble_pred
-            return df
-        else:
+        positions = self._predict_positions_per_model(X)
+        if not positions:
             return pd.DataFrame()
+
+        data: Dict[str, np.ndarray] = {}
+        for name, pos in positions.items():
+            w = float(self.weights.get(name, 0.0))
+            data[f"{name}_position"] = pos
+            data[f"{name}_weight"] = np.full(len(X), w)
+            data[f"{name}_contrib"] = pos * w
+        df = pd.DataFrame(data, index=X.index)
+        df["ensemble_position"] = ensemble_pos
+        return df
 
     def save(self, directory: Path = MODELS_DIR) -> Path:
         """Save the ensemble model state (config, weights, errors) to disk.
@@ -463,6 +728,22 @@ class EnsembleModel(BaseModel):
             "weights": self.weights,
             "errors": self.errors,
             "is_fitted": self.is_fitted,
+            "kinds": self.kinds,
+            "vol_window": self.vol_window,
+            "vol_floor": self.vol_floor,
+            "target_vol": self.target_vol,
+            "position_cap": self.position_cap,
+            "meta_cv_folds": self.meta_cv_folds,
+            "meta_embargo_pct": self.meta_embargo_pct,
+            "conformal_alpha_target": self.conformal_alpha_target,
+            "conformal_aci_gamma": self.conformal_aci_gamma,
+            "conformal_abs_residuals": (
+                self.conformal.abs_residuals if self.conformal is not None else None
+            ),
+            "conformal_position_cap": (
+                self.conformal.position_cap if self.conformal is not None else None
+            ),
+            "aci_alpha_t": self.aci.alpha_t if self.aci is not None else None,
             "models": {},
         }
 
@@ -518,6 +799,37 @@ class EnsembleModel(BaseModel):
         self.weights = loaded_state["weights"]
         self.errors = loaded_state["errors"]
         self.is_fitted = loaded_state["is_fitted"]
+        self.kinds = loaded_state.get("kinds", {n: model_kind(n) for n in self.weights})
+        self.vol_window = loaded_state.get("vol_window", 20)
+        self.vol_floor = loaded_state.get("vol_floor", 5e-3)
+        self.target_vol = loaded_state.get("target_vol", 1.0)
+        self.position_cap = loaded_state.get("position_cap", 1.0)
+        self.meta_cv_folds = loaded_state.get("meta_cv_folds", 3)
+        self.meta_embargo_pct = loaded_state.get("meta_embargo_pct", 0.01)
+
+        # Phase 2.5: restore conformal calibrator + ACI state when present.
+        self.conformal_alpha_target = loaded_state.get("conformal_alpha_target", 0.10)
+        self.conformal_aci_gamma = loaded_state.get("conformal_aci_gamma", 0.01)
+        residuals = loaded_state.get("conformal_abs_residuals")
+        if residuals is not None and len(residuals) > 0:
+            cal = EnbPICalibrator()
+            cal.abs_residuals = np.asarray(residuals, dtype=np.float64)
+            cal.position_cap = float(
+                loaded_state.get("conformal_position_cap", 1.0)
+            )
+            cal.is_fitted = True
+            self.conformal = cal
+            self.aci = ACIState(
+                alpha_target=self.conformal_alpha_target,
+                gamma=self.conformal_aci_gamma,
+                alpha_t=float(
+                    loaded_state.get("aci_alpha_t", self.conformal_alpha_target)
+                ),
+            )
+        else:
+            self.conformal = None
+            self.aci = None
+
         self.models = {}  # Initialize empty
 
         # Initialize path attributes
