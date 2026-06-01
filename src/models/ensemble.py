@@ -637,14 +637,30 @@ class EnsembleModel(BaseModel):
 
             close = X_test[self.target_column].to_numpy()
             sigma = realized_vol(X_test[self.target_column], window=self.vol_window, vol_floor=self.vol_floor)
-            realized_ret = (np.asarray(y_test, dtype=np.float64) - close) / close
+            y_test_arr = np.asarray(y_test, dtype=np.float64)
+            realized_ret = (y_test_arr - close) / close
             y_ideal = ideal_position(realized_ret, sigma, target_vol=self.target_vol, cap=self.position_cap)
 
+            # A forecast member can emit a NaN prediction on real data (e.g.
+            # ARIMA on a degenerate window); it propagates through the blend
+            # into y_pred. sklearn's metrics reject any NaN, which previously
+            # made the whole evaluate() return {} ("Input contains NaN") and
+            # dropped the fold's metrics. Score only the finite rows.
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            finite = np.isfinite(y_pred) & np.isfinite(y_ideal)
+            if finite.sum() < 2:
+                logger.warning(
+                    "evaluate: fewer than 2 finite (y_ideal, y_pred) rows; "
+                    "skipping ensemble metrics."
+                )
+                return {}
+            yi, yp = y_ideal[finite], y_pred[finite]
             metrics = {
-                "position_mae": mean_absolute_error(y_ideal, y_pred),
-                "position_mse": mean_squared_error(y_ideal, y_pred),
-                "position_rmse": float(np.sqrt(mean_squared_error(y_ideal, y_pred))),
-                "position_r2": r2_score(y_ideal, y_pred),
+                "position_mae": mean_absolute_error(yi, yp),
+                "position_mse": mean_squared_error(yi, yp),
+                "position_rmse": float(np.sqrt(mean_squared_error(yi, yp))),
+                "position_r2": r2_score(yi, yp),
+                "position_n_finite": int(finite.sum()),
             }
 
             for name, model in self.models.items():
@@ -655,14 +671,24 @@ class EnsembleModel(BaseModel):
                             logger.warning(f"Individual eval skipped for {name}: length mismatch.")
                         continue
                     if self.kinds.get(name) == "forecast":
-                        metrics[f"{name}_price_mae"] = mean_absolute_error(y_test, model_preds)
-                        metrics[f"{name}_price_rmse"] = float(np.sqrt(mean_squared_error(y_test, model_preds)))
+                        pf = np.isfinite(y_test_arr) & np.isfinite(model_preds)
+                        if pf.sum() >= 2:
+                            metrics[f"{name}_price_mae"] = mean_absolute_error(
+                                y_test_arr[pf], model_preds[pf]
+                            )
+                            metrics[f"{name}_price_rmse"] = float(
+                                np.sqrt(mean_squared_error(y_test_arr[pf], model_preds[pf]))
+                            )
                         pos = forecast_to_position(
                             model_preds, close, sigma, target_vol=self.target_vol, cap=self.position_cap
                         )
                     else:
                         pos = np.clip(model_preds, -self.position_cap, self.position_cap)
-                    metrics[f"{name}_position_mae"] = mean_absolute_error(y_ideal, pos)
+                    posf = np.isfinite(y_ideal) & np.isfinite(pos)
+                    if posf.sum() >= 2:
+                        metrics[f"{name}_position_mae"] = mean_absolute_error(
+                            y_ideal[posf], pos[posf]
+                        )
                 except Exception as e:
                     logger.error(f"Error evaluating {name}: {e}")
 
@@ -765,10 +791,24 @@ class EnsembleModel(BaseModel):
                 else:
                     logger.warning("XLSTMGRPOAgent model was fitted but no save path was stored.")
             else:
-                # Add handling for other model types if they need specific saving
-                # For now, we assume they are handled elsewhere or not saved with the ensemble state
-                # Example: save_state['models'][name] = self.models[name].save(directory / name)
-                pass
+                # Forecast members (arima/prophet/lstm/xgboost) own their
+                # save(directory)/load(path); delegate to them and store the
+                # returned path RELATIVE to this ensemble dir so the run stays
+                # relocatable. Previously this branch was a no-op, so a loaded
+                # ensemble silently came back with UNFITTED members → all-zero
+                # positions → zero trades in every backtest fold.
+                member = self.models[name]
+                if not getattr(member, "is_fitted", False):
+                    logger.warning(
+                        f"Member '{name}' not fitted at save time; skipping persistence."
+                    )
+                    continue
+                try:
+                    saved_path = Path(member.save(directory))
+                    rel = saved_path.resolve().relative_to(directory.resolve())
+                    save_state["models"][name] = {"forecast_rel_path": str(rel)}
+                except Exception as e:
+                    logger.error(f"Error saving member '{name}': {e}")
 
         # Save the state to the pickle file
         try:
@@ -898,8 +938,35 @@ class EnsembleModel(BaseModel):
                     logger.error(f"Error loading XLSTMGRPOAgent model from path {saved_model_info}: {e}")
                     self.is_fitted = False  # Mark as not fitted if XLSTMGRPOAgent failed to load
             else:
-                # Assume other models were pickled directly
-                self.models[name] = saved_model_info
+                # Forecast members: reconstruct the instance and load it from
+                # the path stored (relative to this ensemble dir) by save().
+                # Legacy pickles that stored the object directly still load via
+                # the fallback branch.
+                if isinstance(saved_model_info, dict) and "forecast_rel_path" in saved_model_info:
+                    member = self._create_model(name)
+                    if member is None:
+                        logger.warning(
+                            f"Could not re-create member '{name}'; marking ensemble unfitted."
+                        )
+                        self.is_fitted = False
+                        continue
+                    member_path = Path(model_path).parent / saved_model_info["forecast_rel_path"]
+                    try:
+                        member.load(member_path)
+                        if not getattr(member, "is_fitted", False):
+                            logger.warning(
+                                f"Member '{name}' loaded from {member_path} but reports not fitted."
+                            )
+                            self.is_fitted = False
+                        self.models[name] = member
+                    except Exception as e:
+                        logger.error(
+                            f"Error loading member '{name}' from {member_path}: {e}"
+                        )
+                        self.is_fitted = False
+                else:
+                    # Legacy: a directly-pickled model object.
+                    self.models[name] = saved_model_info
 
         # Re-create models specified in config but not found in loaded state (optional, depends on desired behavior)
         for model_config in self.config.models:

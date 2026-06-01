@@ -118,7 +118,7 @@ class ARIMAModel(BaseModel):
                 if aic < best_aic:
                     best_aic = aic
                     best_order = (p, d, q)
-            except Exception as e:
+            except Exception:
                 continue
 
         # If data is seasonal, try seasonal orders
@@ -136,7 +136,7 @@ class ARIMAModel(BaseModel):
                             if aic < best_aic:
                                 best_aic = aic
                                 best_seasonal_order = (P, D, Q, s)
-                        except Exception as e:
+                        except Exception:
                             continue
 
         if best_order is None:

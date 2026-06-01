@@ -43,6 +43,7 @@ from src.data_loader import DataLoader, _tz_aware_filter
 from src.features import FeatureEngineer
 from src.models.ensemble import EnsembleModel
 from src.sentiment_analysis import SentimentAnalyzer
+from src.logging_utils import configure_logging, get_symbol_logger
 from src.tracking.mlflow_utils import (
     init_mlflow,
     log_artifact_dir,
@@ -61,13 +62,9 @@ except AttributeError:
     )
     warnings.simplefilter(action="ignore", category=FutureWarning)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# Logging is configured in main() via configure_logging() so --verbose and the
+# per-run log file are honored; this module-level logger is the fallback name.
 logger = logging.getLogger(__name__)
-logging.getLogger("prophet").setLevel(logging.WARNING)
-logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 
 
 def parse_args():
@@ -134,6 +131,9 @@ def parse_args():
     # MLflow
     parser.add_argument("--experiment", type=str, default="trading_ensemble",
                         help="MLflow experiment name")
+
+    parser.add_argument("--verbose", action="store_true",
+                        help="Console DEBUG logging (the log file is always DEBUG)")
 
     return parser.parse_args()
 
@@ -526,6 +526,7 @@ def main():
     """Main function."""
     args = parse_args()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    configure_logging(verbose=args.verbose, run_name="training")
 
     gpu_available = False
     if args.gpu:
@@ -579,7 +580,7 @@ def main():
 
     enhanced_data: Dict[str, pd.DataFrame] = {}
     for symbol, raw_df in all_data.items():
-        logger.info(f"Building features for {symbol}")
+        get_symbol_logger(logger, symbol).info("Building features")
         enhanced_data[symbol] = build_features(
             raw_df=raw_df,
             symbol=symbol,
@@ -631,6 +632,9 @@ def main():
         for symbol, full_df in enhanced_data.items():
             symbol_dir = output_dir / symbol
             symbol_dir.mkdir(parents=True, exist_ok=True)
+            get_symbol_logger(logger, symbol).info(
+                "Training WFO folds (%d bars)", len(full_df)
+            )
 
             with mlflow.start_run(run_name=symbol, nested=True):
                 per_fold_metrics = train_symbol_wfo(

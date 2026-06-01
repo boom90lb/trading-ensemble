@@ -16,6 +16,7 @@ DATA_DIR = PROJECT_DIR / "data"
 MODELS_DIR = PROJECT_DIR / "models"
 RESULTS_DIR = PROJECT_DIR / "results"
 MLRUNS_DIR = PROJECT_DIR / "mlruns"
+LOGS_DIR = PROJECT_DIR / "logs"
 
 for directory in [DATA_DIR, MODELS_DIR, RESULTS_DIR]:
     directory.mkdir(exist_ok=True, parents=True)

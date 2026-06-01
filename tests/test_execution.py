@@ -22,7 +22,7 @@ from src.execution.costs import (
     slippage_bps,
 )
 from src.models.base import BaseModel
-from src.trading import Position, TradingStrategy
+from src.trading import TradingStrategy
 
 
 # ---------- pure cost functions ----------

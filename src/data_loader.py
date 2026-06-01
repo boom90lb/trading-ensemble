@@ -117,6 +117,19 @@ def _parse_dividends_payload(data) -> pd.Series:
     return s
 
 
+# Twelvedata's time_series endpoint expects interval strings like "1day"/
+# "1week"/"1month"; the project (config defaults, cache filenames, CLI) uses
+# the shorter "1d"/"1wk"/"1mo" convention. Normalize ONLY at the API boundary
+# so cache keys and config stay in the project convention. Intraday strings
+# ("1h", "2h", ...) already match the vendor and pass through unchanged.
+_VENDOR_INTERVALS = {"1d": "1day", "1wk": "1week", "1mo": "1month"}
+
+
+def _to_vendor_interval(interval: str) -> str:
+    """Map the project's interval shorthand to Twelvedata's expected string."""
+    return _VENDOR_INTERVALS.get(interval, interval)
+
+
 class DataLoader:
     """Data loader class for fetching and preparing time series data."""
 
@@ -226,7 +239,7 @@ class DataLoader:
             # Prepare API parameters
             params = {
                 "symbol": symbol,
-                "interval": interval,
+                "interval": _to_vendor_interval(interval),
                 "apikey": self.api_key,
                 "format": "json",
                 "outputsize": output_size,

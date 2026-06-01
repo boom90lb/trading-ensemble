@@ -14,12 +14,13 @@ import pandas as pd  # type: ignore
 from src.config import MODELS_DIR, RESULTS_DIR
 from src.data_loader import DataLoader
 from src.features import FeatureEngineer
+from src.logging_utils import configure_logging
 from src.models.ensemble import EnsembleModel
 from src.models.lstm_ppo import LSTMPPO
 from src.sentiment_analysis import SentimentAnalyzer
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# Logging configured in main() via configure_logging() (honors --verbose and
+# the per-run log file). Module-level logger is the fallback name.
 logger = logging.getLogger(__name__)
 
 
@@ -283,6 +284,7 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
 def main():
     """Main function."""
     args = parse_args()
+    configure_logging(verbose=args.verbose, run_name="prediction")
 
     # Parse symbols
     symbols = args.symbols.split(",")

@@ -140,6 +140,8 @@ mlruns/
 data/*
 !data/universe/
 runs/
+results/
+logs/
 tensorboard_logs/
 
 # Environments

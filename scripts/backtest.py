@@ -53,6 +53,7 @@ from src.tracking.mlflow_utils import (
     log_metrics_safe,
     log_params_safe,
 )
+from src.logging_utils import configure_logging, get_symbol_logger
 from src.trading import TradingStrategy
 from src.validation.metrics import (
     deflated_sharpe_ratio,
@@ -60,10 +61,8 @@ from src.validation.metrics import (
     probability_backtest_overfitting,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# Logging configured in main() via configure_logging() (honors --verbose and
+# the per-run log file). Module-level logger is the fallback name.
 logger = logging.getLogger(__name__)
 
 
@@ -126,6 +125,11 @@ def parse_args():
     parser.add_argument(
         "--experiment", type=str, default="trading_ensemble_backtest",
         help="MLflow experiment name",
+    )
+
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Console DEBUG logging (the log file is always DEBUG)",
     )
 
     return parser.parse_args()
@@ -492,7 +496,8 @@ def _plot_equity(
     equity["portfolio_value"].plot(ax=ax1, label="Portfolio", color="blue")
     ax1.set_ylabel("Portfolio Value ($)")
     ax1.set_title("WFO Backtest Equity")
-    ax1.legend(); ax1.grid(True)
+    ax1.legend()
+    ax1.grid(True)
     equity["drawdown"].plot(
         ax=ax2, label="Drawdown", color="red",
     )
@@ -510,6 +515,7 @@ def _plot_equity(
 
 def main():
     args = parse_args()
+    configure_logging(verbose=args.verbose, run_name="backtest")
 
     training_run_dir = Path(args.training_run)
     if not training_run_dir.is_dir():
@@ -568,9 +574,8 @@ def main():
 
         all_symbol_results: List[Dict[str, Any]] = []
         for symbol, fold_dirs in fold_dirs_per_symbol.items():
-            logger.info(
-                f"WFO backtest for {symbol} across {len(fold_dirs)} folds"
-            )
+            sym_log = get_symbol_logger(logger, symbol)
+            sym_log.info("WFO backtest across %d folds", len(fold_dirs))
 
             raw_df = data_loader.fetch_historical_data(
                 symbol=symbol,

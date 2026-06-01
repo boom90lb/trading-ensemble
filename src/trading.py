@@ -83,6 +83,7 @@ class TradingStrategy:
         date: pd.Timestamp,
         sentiment_data: Optional[pd.DataFrame] = None,
         band_width: Optional[float] = None,
+        features: Optional[pd.DataFrame] = None,
     ) -> Tuple[Position, float]:
         """Translate an ensemble position ∈ [-1, 1] into a discrete trade.
 
@@ -90,6 +91,11 @@ class TradingStrategy:
         no longer re-derives expected return from price. Sign → LONG/SHORT/FLAT;
         magnitude → confidence. `current_price` is kept in the signature for
         downstream callers but is no longer used for signal direction.
+
+        ``features`` is the same per-bar window fed to ``model.predict``; it is
+        forwarded to ``get_model_contributions`` for the inter-model-agreement
+        confidence boost. Passing it is required — an empty frame makes the
+        ensemble's vol-sizing raise "requires 'close'" and the boost no-ops.
 
         Phase 2.5: when band_width is provided (from conformal predict_band),
         scales confidence down by the width of the position-space band. Wider
@@ -105,12 +111,14 @@ class TradingStrategy:
 
         # Confidence: start from |position|, boost on inter-model agreement.
         confidence = abs(position_target)
-        if isinstance(self.model, EnsembleModel):
+        if isinstance(self.model, EnsembleModel) and features is not None and not features.empty:
             try:
-                contributions = self.model.get_model_contributions(pd.DataFrame(index=[date]))
+                contributions = self.model.get_model_contributions(features)
                 if not contributions.empty:
+                    # Use the LAST row — the current bar's decision — to match
+                    # how predict()'s latest_prediction is taken.
                     member_positions = [
-                        contributions[f"{name}_position"].iloc[0]
+                        contributions[f"{name}_position"].iloc[-1]
                         for name in self.model.models.keys()
                         if f"{name}_position" in contributions.columns
                     ]
@@ -605,6 +613,17 @@ class TradingStrategy:
                 # per fed row → the LAST element is this bar's decision.
                 hist = getattr(self.model, "required_history", 1)
                 features_df = symbol_data.loc[:date].iloc[-hist:].copy()
+                # Match the column set the members were FIT on: training drops
+                # target_/direction_ label columns before ensemble.fit, and
+                # XGBoost validates feature names strictly, so they must be
+                # excluded here too (else every per-bar predict raises a
+                # feature_names mismatch and the member contributes nothing).
+                _label_cols = [
+                    c for c in features_df.columns
+                    if "target_" in c or "direction_" in c
+                ]
+                if _label_cols:
+                    features_df = features_df.drop(columns=_label_cols)
 
                 conformal_on = (
                     isinstance(self.model, EnsembleModel) and self.model.has_conformal()
@@ -663,7 +682,7 @@ class TradingStrategy:
                             )
                     position, confidence = self.calculate_signal(
                         latest_prediction, price, symbol, date, symbol_sentiment,
-                        band_width=band_width
+                        band_width=band_width, features=features_df,
                     )
                     self.submit_signal_order(
                         symbol=symbol,
@@ -951,7 +970,6 @@ class TradingStrategy:
         if self.transaction_log:
             trades_df = pd.DataFrame(self.transaction_log)
             opens = trades_df[trades_df["action"].str.startswith("OPEN")]
-            closes = trades_df[trades_df["action"].str.startswith("CLOSE")]
 
             report.append(f"Total trades: {len(opens)}")
 
@@ -963,9 +981,7 @@ class TradingStrategy:
 
             # Calculate by position type
             long_opens = trades_df[trades_df["action"] == "OPEN_LONG"]
-            long_closes = trades_df[trades_df["action"] == "CLOSE_LONG"]
             short_opens = trades_df[trades_df["action"] == "OPEN_SHORT"]
-            short_closes = trades_df[trades_df["action"] == "CLOSE_SHORT"]
 
             report.append(f"Long trades: {len(long_opens)}")
             report.append(f"Short trades: {len(short_opens)}")

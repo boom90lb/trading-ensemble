@@ -60,8 +60,16 @@ class ProphetModel(BaseModel):
             # Store feature names
             self.feature_names = X_train.columns.tolist()
 
-            # Prophet requires a specific dataframe format with 'ds' and 'y' columns
-            prophet_df = pd.DataFrame({"ds": y_train.index, "y": y_train.values})
+            # Prophet requires a specific dataframe format with 'ds' and 'y'
+            # columns. 'ds' must be tz-NAIVE — Prophet rejects tz-aware
+            # timestamps ("Column ds has timezone specified, which is not
+            # supported"), and the project's bars have been tz-localized to
+            # America/New_York since the Phase-4 B12 fix, so strip the zone
+            # here at the Prophet boundary.
+            ds = y_train.index
+            if isinstance(ds, pd.DatetimeIndex) and ds.tz is not None:
+                ds = ds.tz_localize(None)
+            prophet_df = pd.DataFrame({"ds": ds, "y": y_train.values})
 
             # Create and fit the Prophet model
             model = Prophet(
@@ -156,8 +164,12 @@ class ProphetModel(BaseModel):
             return np.array([])
 
         try:
-            # Create future dataframe for prediction
-            future = pd.DataFrame({"ds": X.index})
+            # Create future dataframe for prediction. 'ds' must be tz-naive to
+            # match fit() (Prophet rejects tz-aware timestamps).
+            future_ds = X.index
+            if isinstance(future_ds, pd.DatetimeIndex) and future_ds.tz is not None:
+                future_ds = future_ds.tz_localize(None)
+            future = pd.DataFrame({"ds": future_ds})
 
             # Prepare regressors if they were used during training
             extra_regressors = getattr(self.model, "extra_regressors", [])
