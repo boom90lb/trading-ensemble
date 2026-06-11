@@ -70,6 +70,8 @@ dev = [
 [project.scripts]
 trading-backtest = "scripts.backtest:main"
 trading-prediction = "scripts.prediction:main"
+trading-stat-arb = "scripts.stat_arb:main"
+trading-stat-arb-wfo = "scripts.stat_arb_wfo:main"
 trading-training = "scripts.training:main"
 
 [tool.hatch.build.targets.wheel]

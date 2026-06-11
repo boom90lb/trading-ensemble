@@ -198,7 +198,7 @@ class SentimentAnalyzer:
         Args:
             api_key: Polygon.io API key (default: use from config)
         """
-        self.api_key = api_key or POLYGON_API_KEY
+        self.api_key = POLYGON_API_KEY if api_key is None else api_key
         if not self.api_key:
             logger.warning("No Polygon API key provided, sentiment analysis will be limited")
 

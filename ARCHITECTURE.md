@@ -13,6 +13,13 @@ Twelvedata API ──► DataLoader ──► FeatureEngineer ──► PurgedWa
                                       train-only clip)                       vol-sized blend)    costs, borrow)
 ```
 
+The statistical-arbitrage path is intentionally separate:
+
+```
+close/open matrix ──► rolling formation/test folds ──► train-only pair scan ──► causal spread targets ──► capped pair portfolio ──► next-open accounting
+                    (fixed candidates per fold)       (coint + ADF + FDR)      (z-score state machine)    (gross/symbol limits)     (costs + borrow)
+```
+
 ### 1. Ingestion — `src/data_loader.py`
 - `DataLoader.fetch_historical_data` pulls split-adjusted daily bars, caches to
   `data/{symbol}_{interval}_{start}_{end}.parquet`, returns a tz-aware
@@ -69,6 +76,20 @@ Twelvedata API ──► DataLoader ──► FeatureEngineer ──► PurgedWa
   path so PBO is computed across a fold-aligned strategy set.
 - `conformal/`: EnbPI block-cross-conformal + ACI online α-adaptation.
 
+### 7. Statistical arbitrage — `src/arbitrage/`, `scripts/stat_arb*.py`
+- `pairs.py`: train-only Engle-Granger pair scan, residual ADF check,
+  Benjamini-Hochberg FDR control, half-life and beta-drift filters, and causal
+  spread-z target generation. The report variant also records raw candidates,
+  the FDR cutoff, and rejection counts.
+- `portfolio.py`: combines pair target weights under gross/per-symbol caps and
+  backtests close-time targets with next-open fills, spread, commission, impact,
+  and borrow.
+- `walk_forward.py`: rolls formation/test windows, freezes selected pairs per
+  fold, forces fold-end targets flat, records pair turnover and fold metrics,
+  and reports `pair_set_dsr` from selected pair-book trial Sharpes.
+- This is the market-neutral research path. It does not use the single-symbol
+  ensemble, because independent ticker forecasts are not an arbitrage book.
+
 ## Scripts (`scripts/`) — the entry points
 
 | Script | Role | Key output |
@@ -77,6 +98,8 @@ Twelvedata API ──► DataLoader ──► FeatureEngineer ──► PurgedWa
 | `backtest.py` | replay per-fold models, net WFO-OOS + baselines + PBO/DSR | `results/wfo_backtest_*/summary.json` |
 | `sweep.py` | ensemble-layer grid → honest DSR (forecast-only) | `trial_sharpes.json`, `selected_config.json` |
 | `rl_seed_eval.py` | multi-seed RL overfitting study | `rl_seed_eval.json` |
+| `stat_arb.py` | train-only cointegration scan → market-neutral pair portfolio | `pairs.json`, `summary.json`, weights/costs CSVs |
+| `stat_arb_wfo.py` | rolling formation/test stat-arb WFO with fold-selection ledgers | `folds.json`, `pairs.json`, `summary.json`, weights/costs CSVs |
 | `prediction.py` | point predictions from a saved model | CSV + plot |
 
 `config.py` is the single source of truth (weights, hyperparams, dirs, dataclass
@@ -94,3 +117,6 @@ installs console+rotating-file logging.
   mapped before blending (the B8 fix); never average ŷ with positions.
 - **Members can be silently dropped from the blend** if `predict` returns a
   length ≠ `len(X)` — currently the forecast `lstm`. See `docs/operations.md`.
+- **Arbitrage logic lives in `src/arbitrage/`**, not in the directional
+  ensemble. A strategy claiming arbitrage should produce cross-asset hedged
+  target weights and portfolio-level PnL, not independent symbol signals.

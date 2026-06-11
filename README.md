@@ -7,6 +7,11 @@ evaluates it under a **methodology designed to produce honest out-of-sample
 numbers** — purged walk-forward CV, next-open fills with realistic costs,
 mandatory baselines, and overfitting-adjusted metrics (DSR, PBO).
 
+It also includes a separate statistical-arbitrage path for market-neutral pair
+research: train-only cointegration discovery, residual stationarity and
+multiple-testing filters, causal spread targets, capped portfolio weights, and
+next-open costed accounting. See [`docs/stat_arb.md`](docs/stat_arb.md).
+
 The emphasis is on *trustworthy evaluation*, not on a deployable alpha. The
 default universe and hyperparameters are illustrative; the value is in the
 harness around them.
@@ -182,6 +187,24 @@ python -m scripts.rl_seed_eval --training_run runs/{run_name} \
     --members lstm_ppo --seeds 0,1,2 --rl_timesteps 50000
 ```
 
+### 5. Statistical arbitrage pair research
+
+```bash
+# Rolling formation/test walk-forward. This is the credible research path.
+python -m scripts.stat_arb_wfo --symbols AAPL,MSFT,GOOG,AMZN,META,NVDA \
+    --start_date 2020-01-01 --formation_bars 504 --test_bars 63 --max_pairs 5
+
+# Single formation/test smoke test.
+python -m scripts.stat_arb --symbols AAPL,MSFT,GOOG,AMZN,META,NVDA \
+    --start_date 2020-01-01 --formation_bars 504 --max_pairs 5
+```
+
+This is the only path in the repo that should currently be called
+"arbitrage-like": it forms cross-asset hedge-ratio books rather than independent
+single-symbol bets. The WFO command writes fold-level pair selection ledgers,
+target weights, returns, costs, pair-trial Sharpes, and a `pair_set_dsr` field
+so pair-search bias is visible rather than hidden behind a raw Sharpe.
+
 Add `--verbose` to any script for console DEBUG output (the per-run log file is
 always DEBUG regardless — see **Logging**).
 
@@ -266,14 +289,18 @@ src/
   execution/           ExecutionModel + cost functions
   validation/          PurgedWalkForward, metrics (PSR/PBO/DSR/Calmar)
   conformal/           EnbPI + ACI
+  arbitrage/           cointegration pair scan, causal spread signals,
+                       capped portfolio accounting
   tracking/            MLflow wrappers
 scripts/
   training.py          per-symbol purged-WFO training → runs/{run_name}/
   backtest.py          WFO backtest vs per-fold models + baselines + PBO/DSR
   sweep.py             ensemble-layer grid → DSR
   rl_seed_eval.py      multi-seed RL overfitting study
+  stat_arb.py          train-only pairs stat-arb backtest
+  stat_arb_wfo.py      rolling formation/test pairs stat-arb WFO
   prediction.py        point predictions from a saved model
-tests/                 ~206 tests (validation, leakage, execution, conformal, logging)
+tests/                 ~223 tests (validation, leakage, execution, conformal, logging)
 ```
 
 ## Configuration
