@@ -513,7 +513,12 @@ class EnsembleModel(BaseModel):
             )
         return pd.Series(out, index=X.index).dropna()
 
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
+    def predict(
+        self,
+        X: pd.DataFrame,
+        *,
+        policy_X: Optional[pd.DataFrame] = None,
+    ) -> np.ndarray:
         """Return ensemble positions in [-1, 1].
 
         Forecast members' ŷ are mapped to positions via inverse-volatility
@@ -525,7 +530,7 @@ class EnsembleModel(BaseModel):
             logger.warning("Ensemble model not fitted yet")
             return np.array([])
 
-        positions = self._predict_positions_per_model(X)
+        positions = self._predict_positions_per_model(X, policy_X=policy_X)
         if not positions:
             logger.warning("No valid model positions available")
             return np.array([])
@@ -551,14 +556,19 @@ class EnsembleModel(BaseModel):
         """True when fit() produced a usable conformal calibrator + ACI state."""
         return self.conformal is not None and self.conformal.is_fitted and self.aci is not None
 
-    def predict_band(self, X: pd.DataFrame) -> tuple:
+    def predict_band(
+        self,
+        X: pd.DataFrame,
+        *,
+        policy_X: Optional[pd.DataFrame] = None,
+    ) -> tuple:
         """Return ``(lower, point, upper)`` position-space conformal bands.
 
         Falls back to maximally-wide bands (±position_cap) when no conformal
         calibrator was fit — this lets downstream code call predict_band
         unconditionally and still get a no-op interval.
         """
-        point = self.predict(X)
+        point = self.predict(X, policy_X=policy_X)
         if not self.has_conformal() or len(point) == 0:
             lower = np.full(len(point), -self.position_cap)
             upper = np.full(len(point), self.position_cap)
@@ -579,7 +589,12 @@ class EnsembleModel(BaseModel):
             return None
         return self.aci.update(in_band)  # type: ignore[union-attr]
 
-    def _predict_positions_per_model(self, X: pd.DataFrame) -> Dict[str, np.ndarray]:
+    def _predict_positions_per_model(
+        self,
+        X: pd.DataFrame,
+        *,
+        policy_X: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, np.ndarray]:
         """Run each member's predict and convert to a position vector."""
         if self.target_column not in X.columns:
             logger.error(
@@ -587,21 +602,26 @@ class EnsembleModel(BaseModel):
                 "(needed for forecast→position vol sizing)."
             )
             return {}
+        if policy_X is not None and len(policy_X) != len(X):
+            raise ValueError(
+                f"policy_X length {len(policy_X)} does not match forecast X length {len(X)}"
+            )
         close = X[self.target_column].to_numpy()
         sigma = realized_vol(X[self.target_column], window=self.vol_window, vol_floor=self.vol_floor)
 
         positions: Dict[str, np.ndarray] = {}
         for name, model in self.models.items():
             try:
-                raw = model.predict(X)
-                if len(raw) != len(X):
+                kind = self.kinds.get(name, model_kind(name))
+                member_X = policy_X if kind == "policy" and policy_X is not None else X
+                raw = model.predict(member_X)
+                if len(raw) != len(member_X):
                     if len(raw) > 0:
                         logger.warning(
-                            f"{name}: predict returned {len(raw)} rows for {len(X)} input rows; skipping."
+                            f"{name}: predict returned {len(raw)} rows for {len(member_X)} input rows; skipping."
                         )
                     continue
                 raw_arr = np.asarray(raw, dtype=np.float64)
-                kind = self.kinds.get(name, model_kind(name))
                 if kind == "forecast":
                     positions[name] = forecast_to_position(
                         raw_arr, close, sigma, target_vol=self.target_vol, cap=self.position_cap
@@ -697,7 +717,12 @@ class EnsembleModel(BaseModel):
             logger.error(f"Error evaluating ensemble: {e}")
             return {}
 
-    def get_model_contributions(self, X: pd.DataFrame) -> pd.DataFrame:
+    def get_model_contributions(
+        self,
+        X: pd.DataFrame,
+        *,
+        policy_X: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
         """Per-model positions, weights, and weighted contributions.
 
         Columns: `{name}_position`, `{name}_weight`, `{name}_contrib`, plus
@@ -708,12 +733,12 @@ class EnsembleModel(BaseModel):
             logger.warning("Ensemble model not fitted yet")
             return pd.DataFrame()
 
-        ensemble_pos = self.predict(X)
+        ensemble_pos = self.predict(X, policy_X=policy_X)
         if len(ensemble_pos) != len(X):
             logger.warning("Ensemble prediction length mismatch in get_model_contributions")
             return pd.DataFrame()
 
-        positions = self._predict_positions_per_model(X)
+        positions = self._predict_positions_per_model(X, policy_X=policy_X)
         if not positions:
             return pd.DataFrame()
 

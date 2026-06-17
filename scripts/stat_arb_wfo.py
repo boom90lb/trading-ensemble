@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +19,12 @@ from src.arbitrage import (
 )
 from src.config import ExecutionConfig, RESULTS_DIR
 from src.logging_utils import configure_logging
+from src.validation.trials import (
+    current_git_commit,
+    emit_research_claim_packet,
+    summary_claim_fields,
+    validate_claim_packet_dir,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +101,17 @@ def main() -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    artifacts = {
+        "pairs": "pairs.json",
+        "folds": "folds.json",
+        "returns": "returns.csv",
+        "equity": "equity.csv",
+        "target_weights": "target_weights.csv",
+        "costs": "costs.csv",
+        "pair_trial_sharpes": "pair_trial_sharpes.csv",
+        "summary": "summary.json",
+        "claim_packet": "claim_packet.json",
+    }
     folds_payload = [fold_result_to_dict(fold) for fold in result.folds]
     pairs_payload = [
         {
@@ -106,20 +124,52 @@ def main() -> None:
         }
         for fold in folds_payload
     ]
-    (out_dir / "pairs.json").write_text(json.dumps(pairs_payload, indent=2, allow_nan=True))
-    (out_dir / "folds.json").write_text(json.dumps(folds_payload, indent=2, allow_nan=True))
-    result.portfolio.returns.to_csv(out_dir / "returns.csv")
-    result.portfolio.equity.to_csv(out_dir / "equity.csv")
-    result.portfolio.target_weights.to_csv(out_dir / "target_weights.csv")
-    result.portfolio.costs.to_csv(out_dir / "costs.csv")
+    (out_dir / artifacts["pairs"]).write_text(json.dumps(pairs_payload, indent=2, allow_nan=True))
+    (out_dir / artifacts["folds"]).write_text(json.dumps(folds_payload, indent=2, allow_nan=True))
+    result.portfolio.returns.to_csv(out_dir / artifacts["returns"])
+    result.portfolio.equity.to_csv(out_dir / artifacts["equity"])
+    result.portfolio.target_weights.to_csv(out_dir / artifacts["target_weights"])
+    result.portfolio.costs.to_csv(out_dir / artifacts["costs"])
     pd.Series(result.pair_trial_sharpes, name="daily_sharpe").to_csv(
-        out_dir / "pair_trial_sharpes.csv",
+        out_dir / artifacts["pair_trial_sharpes"],
         index_label="trial",
     )
-    (out_dir / "summary.json").write_text(json.dumps(result.summary, indent=2, allow_nan=True))
+
+    config_payload = {
+        "selection": asdict(selection_cfg),
+        "signal": asdict(signal_cfg),
+        "walk": asdict(walk_cfg),
+        "execution": asdict(execution),
+    }
+    data_payload = {
+        "symbols": symbols,
+        "start_date": args.start_date,
+        "end_date": args.end_date,
+        "source": "Twelvedata",
+        "bar_interval": "1d",
+        "data_convention": "split_adjusted_open_close_price_return_no_dividends",
+        "universe_policy": "explicit_symbol_list",
+    }
+    packet = emit_research_claim_packet(
+        out_dir,
+        filename=artifacts["claim_packet"],
+        strategy="pairs_stat_arb_wfo",
+        config=config_payload,
+        data=data_payload,
+        returns=result.portfolio.returns,
+        costs=result.portfolio.costs,
+        target_weights=result.portfolio.target_weights,
+        summary=result.summary,
+        artifacts=artifacts,
+        code_commit=current_git_commit(RESULTS_DIR.parent),
+    )
+
+    summary_payload = {**result.summary, **summary_claim_fields(packet, packet_filename=artifacts["claim_packet"])}
+    (out_dir / artifacts["summary"]).write_text(json.dumps(summary_payload, indent=2, allow_nan=True))
+    validate_claim_packet_dir(out_dir)
     print(
         json.dumps(
-            {"output_dir": str(out_dir), **result.summary},
+            {"output_dir": str(out_dir), **summary_payload},
             indent=2,
             allow_nan=True,
         )

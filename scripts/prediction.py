@@ -11,13 +11,13 @@ import matplotlib.pyplot as plt  # type: ignore
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
 
+from scripts.training import parse_model_names, reject_sentiment_flag
 from src.config import MODELS_DIR, RESULTS_DIR
 from src.data_loader import DataLoader
 from src.features import FeatureEngineer
 from src.logging_utils import configure_logging
 from src.models.ensemble import EnsembleModel
 from src.models.lstm_ppo import LSTMPPO
-from src.sentiment_analysis import SentimentAnalyzer
 
 # Logging configured in main() via configure_logging() (honors --verbose and
 # the per-run log file). Module-level logger is the fallback name.
@@ -112,6 +112,8 @@ def load_model(path=None, horizon=5):
             logger.error(f"Loaded object from {path} is not an EnsembleModel or a recognized state dictionary.")
             raise TypeError(f"Expected EnsembleModel or state dict, got {type(model)}")
 
+    if isinstance(model, EnsembleModel):
+        parse_model_names(",".join(model.models.keys()))
     return model
 
 
@@ -136,11 +138,8 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
     # Initialize feature engineer
     feature_engineer = FeatureEngineer()
 
-    # Initialize sentiment analyzer if requested
+    reject_sentiment_flag(use_sentiment, surface="prediction")
     sentiment_analyzer = None
-    if use_sentiment:
-        logger.info("Initializing sentiment analyzer")
-        sentiment_analyzer = SentimentAnalyzer()
 
     # Set date range
     end_date = datetime.now().strftime("%Y-%m-%d")

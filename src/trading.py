@@ -15,6 +15,7 @@ from matplotlib.dates import DateFormatter
 from src.config import RESULTS_DIR, TradingConfig
 from src.execution import ExecutionModel, Fill, Order, OrderType
 from src.execution.costs import daily_borrow_dollars
+from src.execution.target_weights import scale_to_max_gross
 from src.models.base import BaseModel
 from src.models.ensemble import EnsembleModel
 from src.models.mapping import realized_vol
@@ -84,6 +85,7 @@ class TradingStrategy:
         sentiment_data: Optional[pd.DataFrame] = None,
         band_width: Optional[float] = None,
         features: Optional[pd.DataFrame] = None,
+        policy_features: Optional[pd.DataFrame] = None,
     ) -> Tuple[Position, float]:
         """Translate an ensemble position ∈ [-1, 1] into a discrete trade.
 
@@ -113,7 +115,10 @@ class TradingStrategy:
         confidence = abs(position_target)
         if isinstance(self.model, EnsembleModel) and features is not None and not features.empty:
             try:
-                contributions = self.model.get_model_contributions(features)
+                contributions = self.model.get_model_contributions(
+                    features,
+                    policy_X=policy_features,
+                )
                 if not contributions.empty:
                     # Use the LAST row — the current bar's decision — to match
                     # how predict()'s latest_prediction is taken.
@@ -178,6 +183,54 @@ class TradingStrategy:
             return Position.SHORT, min(1.0, max(confidence, abs(position_target)))
         else:
             return Position.FLAT, confidence
+
+    def calculate_target_weight(
+        self,
+        predictions: np.ndarray,
+        current_price: float,
+        symbol: str,
+        date: pd.Timestamp,
+        sentiment_data: Optional[pd.DataFrame] = None,
+    ) -> float:
+        """Translate a model position into a continuous portfolio target weight.
+
+        Target-weight mode intentionally bypasses ``signal_threshold``. The
+        model's signed position is scaled by ``position_size``; no trade/no-trade
+        decision is made here because the portfolio accounting layer suppresses
+        small rebalances against the currently filled weight.
+        """
+        del current_price, date
+
+        if len(predictions) == 0:
+            logger.warning("No predictions available for target-weight calculation")
+            return 0.0
+
+        position_target = float(np.clip(predictions[0], -1.0, 1.0))
+        if self.use_sentiment and sentiment_data is not None:
+            try:
+                sentiment_score = (
+                    float(sentiment_data[f"{symbol}_sentiment_score"].iloc[0])
+                    if f"{symbol}_sentiment_score" in sentiment_data.columns
+                    else 0.0
+                )
+                sentiment_momentum = (
+                    float(sentiment_data[f"{symbol}_sentiment_momentum"].iloc[0])
+                    if f"{symbol}_sentiment_momentum" in sentiment_data.columns
+                    else 0.0
+                )
+                sentiment_factor = 0.3
+                sentiment_pos = np.clip((sentiment_score + sentiment_momentum) / 3.0, -1.0, 1.0)
+                position_target = float(
+                    np.clip(
+                        (1.0 - sentiment_factor) * position_target + sentiment_factor * sentiment_pos,
+                        -1.0,
+                        1.0,
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Error incorporating sentiment data: {e}")
+
+        return float(self.config.position_size * position_target)
 
     def submit_signal_order(
         self,
@@ -501,9 +554,133 @@ class TradingStrategy:
         self.execution_model.drop_pending()
         self._bar_dates = {}
 
+    def generate_target_weight_segment(
+        self,
+        data: Dict[str, pd.DataFrame],
+        model_data: Optional[Dict[str, pd.DataFrame]] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        use_sentiment: bool = True,
+    ) -> pd.DataFrame:
+        """Generate close-time target weights over one date segment.
+
+        ``data`` remains the execution-price source and raw policy-member
+        feature source. ``model_data`` optionally supplies fold-scaled features
+        for forecast members, matching ``run_segment``'s train/serve replay
+        path. The returned weights are close-time decisions; the execution
+        layer is responsible for next-open fills and rebalance-band suppression.
+        """
+        if len(data) == 0:
+            logger.warning("No data provided for target-weight segment")
+            return pd.DataFrame()
+
+        all_dates = pd.DatetimeIndex([])
+        for df in data.values():
+            if isinstance(df.index, pd.DatetimeIndex):
+                all_dates = pd.DatetimeIndex(all_dates.union(df.index))
+        all_dates = all_dates.sort_values()
+
+        bar_tz = all_dates.tz if len(all_dates) else None
+        if start_date:
+            start_ts = pd.Timestamp(start_date)
+            if bar_tz is not None and start_ts.tz is None:
+                start_ts = start_ts.tz_localize(bar_tz)
+            all_dates = all_dates[all_dates >= start_ts]
+        if end_date:
+            end_ts = pd.Timestamp(end_date)
+            if bar_tz is not None and end_ts.tz is None:
+                end_ts = end_ts.tz_localize(bar_tz)
+            all_dates = all_dates[all_dates <= end_ts]
+
+        if len(all_dates) == 0:
+            logger.warning("No dates in the specified target-weight range")
+            return pd.DataFrame()
+
+        sentiment_data = {}
+        if use_sentiment and self.use_sentiment and self.sentiment_analyzer:
+            for symbol in data.keys():
+                try:
+                    sentiment_data[symbol] = self.sentiment_analyzer.create_sentiment_features(
+                        symbol,
+                        all_dates,
+                    )
+                except Exception as e:
+                    logger.error(f"Error creating sentiment features for {symbol}: {e}")
+                    sentiment_data[symbol] = pd.DataFrame(index=all_dates)
+
+        rows: List[Dict[str, Union[pd.Timestamp, float]]] = []
+        for date in all_dates:
+            row: Dict[str, Union[pd.Timestamp, float]] = {"date": date}
+            for symbol, symbol_data in data.items():
+                if date not in symbol_data.index:
+                    continue
+                price_row = symbol_data.loc[date]
+                price = float(price_row["close"])
+                symbol_model_data = (
+                    model_data.get(symbol, symbol_data)
+                    if model_data is not None
+                    else symbol_data
+                )
+                if date not in symbol_model_data.index:
+                    logger.warning(
+                        "No model-data row for %s on %s; skipping target",
+                        symbol,
+                        date,
+                    )
+                    continue
+
+                hist = getattr(self.model, "required_history", 1)
+                features_df = symbol_model_data.loc[:date].iloc[-hist:].copy()
+                policy_features_df = symbol_data.loc[:date].iloc[-hist:].copy()
+                label_cols = [
+                    c for c in features_df.columns
+                    if "target_" in c or "direction_" in c
+                ]
+                if label_cols:
+                    features_df = features_df.drop(columns=label_cols)
+                policy_label_cols = [
+                    c for c in policy_features_df.columns
+                    if "target_" in c or "direction_" in c
+                ]
+                if policy_label_cols:
+                    policy_features_df = policy_features_df.drop(columns=policy_label_cols)
+
+                symbol_sentiment = None
+                if use_sentiment and symbol in sentiment_data:
+                    symbol_sentiment = sentiment_data[symbol].loc[date:date].copy()
+
+                try:
+                    if isinstance(self.model, EnsembleModel):
+                        predictions = self.model.predict(
+                            features_df,
+                            policy_X=policy_features_df,
+                        )
+                    else:
+                        predictions = self.model.predict(features_df)
+                    latest_prediction = predictions[-1:] if len(predictions) else predictions
+                    row[symbol] = self.calculate_target_weight(
+                        latest_prediction,
+                        price,
+                        symbol,
+                        date,
+                        symbol_sentiment,
+                    )
+                except Exception as e:
+                    logger.error(f"Error generating target for {symbol} on {date}: {e}")
+                    continue
+            rows.append(row)
+
+        if not rows:
+            return pd.DataFrame()
+        weights = pd.DataFrame(rows).set_index("date")
+        symbols = [symbol for symbol in data.keys() if symbol in weights.columns]
+        weights = weights.reindex(columns=symbols).astype(float)
+        return scale_to_max_gross(weights, self.config.max_gross_exposure)
+
     def run_segment(
         self,
         data: Dict[str, pd.DataFrame],
+        model_data: Optional[Dict[str, pd.DataFrame]] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         use_sentiment: bool = True,
@@ -518,6 +695,11 @@ class TradingStrategy:
         when to ``execution_model.drop_pending()`` — for a one-shot run use
         ``backtest()``; for a WFO loop, reset once before fold 0 and
         ``drop_pending()`` between folds.
+
+        ``data`` remains the execution/accounting source. When ``model_data``
+        is provided, prediction windows are drawn from it by symbol and date;
+        this lets WFO replay use fold-scaled features without changing fill
+        prices or marks.
 
         Returns a DataFrame indexed by date with ``portfolio_value`` and
         ``cash`` columns covering only the bars recorded in THIS segment
@@ -606,13 +788,26 @@ class TradingStrategy:
             # 4. Generate signals + queue orders for bar_idx+1.
             for symbol, price in current_prices.items():
                 symbol_data = data[symbol]
+                symbol_model_data = (
+                    model_data.get(symbol, symbol_data)
+                    if model_data is not None
+                    else symbol_data
+                )
+                if date not in symbol_model_data.index:
+                    logger.warning(
+                        "No model-data row for %s on %s; skipping signal",
+                        symbol,
+                        date,
+                    )
+                    continue
                 # Feed the model enough trailing history to score this bar.
                 # Point models need 1 row; windowed/sequence members (LSTM, RL
                 # agents) need their lookback or predict() errors out and the
                 # member contributes no signal. predict() returns one position
                 # per fed row → the LAST element is this bar's decision.
                 hist = getattr(self.model, "required_history", 1)
-                features_df = symbol_data.loc[:date].iloc[-hist:].copy()
+                features_df = symbol_model_data.loc[:date].iloc[-hist:].copy()
+                policy_features_df = symbol_data.loc[:date].iloc[-hist:].copy()
                 # Match the column set the members were FIT on: training drops
                 # target_/direction_ label columns before ensemble.fit, and
                 # XGBoost validates feature names strictly, so they must be
@@ -624,11 +819,20 @@ class TradingStrategy:
                 ]
                 if _label_cols:
                     features_df = features_df.drop(columns=_label_cols)
+                policy_label_cols = [
+                    c for c in policy_features_df.columns
+                    if "target_" in c or "direction_" in c
+                ]
+                if policy_label_cols:
+                    policy_features_df = policy_features_df.drop(columns=policy_label_cols)
 
                 conformal_on = (
                     isinstance(self.model, EnsembleModel) and self.model.has_conformal()
                 )
-                cur_pos = symbol_data.index.get_loc(date) if conformal_on else 0
+                cur_pos = symbol_model_data.index.get_loc(date) if conformal_on else 0
+                model_price = price
+                if self.model.target_column in symbol_model_data.columns:
+                    model_price = float(symbol_model_data.loc[date, self.model.target_column])
 
                 # Phase 2.5: realize matured conformal bands → ACI online
                 # update. A band queued at t is scored at t+h against the
@@ -638,7 +842,7 @@ class TradingStrategy:
                     pend = conformal_pending[symbol]
                     while pend and cur_pos >= pend[0][0]:
                         _, lo, up, anchor_close, sigma_a = pend.popleft()
-                        realized_ret = price / anchor_close - 1.0
+                        realized_ret = model_price / anchor_close - 1.0
                         realized_ideal = float(
                             np.clip(
                                 self.model.target_vol * realized_ret / sigma_a,
@@ -653,7 +857,13 @@ class TradingStrategy:
                     symbol_sentiment = sentiment_data[symbol].loc[date:date].copy()
 
                 try:
-                    predictions = self.model.predict(features_df)
+                    if isinstance(self.model, EnsembleModel):
+                        predictions = self.model.predict(
+                            features_df,
+                            policy_X=policy_features_df,
+                        )
+                    else:
+                        predictions = self.model.predict(features_df)
                     # predict() returns one position per fed row; the LAST row
                     # is this bar's decision (windowed members emit a vector).
                     latest_prediction = predictions[-1:] if len(predictions) else predictions
@@ -661,12 +871,15 @@ class TradingStrategy:
                     # this band for ACI realization h bars ahead.
                     band_width = None
                     if conformal_on:
-                        lower, point, upper = self.model.predict_band(features_df)
+                        lower, point, upper = self.model.predict_band(
+                            features_df,
+                            policy_X=policy_features_df,
+                        )
                         if len(lower) > 0 and len(upper) > 0:
                             band_width = float(upper[-1] - lower[-1])
                             sigma_now = float(
                                 realized_vol(
-                                    symbol_data[self.model.target_column].loc[:date],
+                                    symbol_model_data[self.model.target_column].loc[:date],
                                     window=self.model.vol_window,
                                     vol_floor=self.model.vol_floor,
                                 )[-1]
@@ -676,13 +889,14 @@ class TradingStrategy:
                                     cur_pos + self.model.horizon,
                                     float(lower[-1]),
                                     float(upper[-1]),
-                                    price,
+                                    model_price,
                                     sigma_now,
                                 )
                             )
                     position, confidence = self.calculate_signal(
                         latest_prediction, price, symbol, date, symbol_sentiment,
                         band_width=band_width, features=features_df,
+                        policy_features=policy_features_df,
                     )
                     self.submit_signal_order(
                         symbol=symbol,
@@ -756,7 +970,11 @@ class TradingStrategy:
         """
         self._reset_state()
         seg_df = self.run_segment(
-            data, start_date, end_date, use_sentiment, dividends=dividends
+            data=data,
+            start_date=start_date,
+            end_date=end_date,
+            use_sentiment=use_sentiment,
+            dividends=dividends,
         )
         self.execution_model.drop_pending()
         if seg_df.empty:

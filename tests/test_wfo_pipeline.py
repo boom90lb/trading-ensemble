@@ -16,6 +16,7 @@ scripts/backtest.py depend on:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List, Tuple
 
@@ -27,6 +28,7 @@ import pytest
 from src.baselines import BuyAndHold
 from src.config import EnsembleConfig, ExecutionConfig, ModelConfig, TradingConfig
 from src.execution import ExecutionModel
+from src.models.base import BaseModel
 from src.models.ensemble import EnsembleModel
 from src.trading import TradingStrategy
 
@@ -50,6 +52,48 @@ def _make_gbm_df(n: int, seed: int = 0, start: str = "2024-01-02") -> pd.DataFra
         index=idx,
     )
     return df
+
+
+def _write_fold_replay_artifacts(
+    fold_dir: Path,
+    *,
+    symbol: str,
+    horizon: int,
+    target_col: str,
+    usable: pd.DataFrame,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+) -> None:
+    from scripts.training import build_fold_metadata
+    from src.features import FeatureEngineer
+
+    train_raw = usable.iloc[train_idx]
+    test_raw = usable.iloc[test_idx]
+    fe = FeatureEngineer()
+    fe.fit_scalers(train_raw, symbol)
+    train_scaled = fe.transform_features(train_raw, symbol, is_train=True)
+    feature_columns = [
+        c for c in train_scaled.columns
+        if "target_" not in c and "direction_" not in c
+    ]
+    fe.save_state(
+        fold_dir / "feature_engineer_state.pkl",
+        symbol=symbol,
+        feature_columns=feature_columns,
+    )
+    with open(fold_dir / "fold_metadata.json", "w") as f:
+        json.dump(
+            build_fold_metadata(
+                symbol=symbol,
+                horizon=horizon,
+                target_col=target_col,
+                train_raw=train_raw,
+                test_raw=test_raw,
+                model_feature_columns=feature_columns,
+            ),
+            f,
+            indent=2,
+        )
 
 
 def _build_strategy() -> Tuple[TradingStrategy, pd.DataFrame, ExecutionConfig]:
@@ -296,6 +340,94 @@ def test_run_segment_no_aci_updates_without_conformal():
     assert not result.empty
 
 
+class _RecordingForecast(BaseModel):
+    def __init__(self) -> None:
+        super().__init__(name="xgboost")
+        self.is_fitted = True
+        self.seen_close: List[List[float]] = []
+
+    def fit(self, X, y=None, **kwargs):
+        return self
+
+    def predict(self, X):
+        self.seen_close.append([float(v) for v in X["close"].to_numpy()])
+        return X["close"].to_numpy(dtype=float)
+
+    def save(self, directory: Path) -> Path:
+        return Path(directory)
+
+    def load(self, model_path: Path):
+        return self
+
+    def evaluate(self, X_test, y_test):
+        return {}
+
+
+class _RecordingPolicy(BaseModel):
+    def __init__(self) -> None:
+        super().__init__(name="lstm_ppo")
+        self.is_fitted = True
+        self.seen_close: List[List[float]] = []
+
+    def fit(self, X, y=None, **kwargs):
+        return self
+
+    def predict(self, X):
+        self.seen_close.append([float(v) for v in X["close"].to_numpy()])
+        return np.full(len(X), 0.5, dtype=float)
+
+    def save(self, directory: Path) -> Path:
+        return Path(directory)
+
+    def load(self, model_path: Path):
+        return self
+
+    def evaluate(self, X_test, y_test):
+        return {}
+
+
+def test_run_segment_keeps_policy_members_on_raw_model_frame():
+    raw = _make_gbm_df(n=8, seed=41)
+    scaled = raw.copy()
+    scaled["open"] = np.linspace(0.10, 0.17, len(scaled))
+    scaled["high"] = scaled["open"] + 0.01
+    scaled["low"] = scaled["open"] - 0.01
+    scaled["close"] = np.linspace(0.20, 0.27, len(scaled))
+
+    forecast = _RecordingForecast()
+    policy = _RecordingPolicy()
+    ensemble = EnsembleModel(target_column="close", horizon=5, config=EnsembleConfig(models=[]))
+    ensemble.models = {"xgboost": forecast, "lstm_ppo": policy}
+    ensemble.weights = {"xgboost": 0.0, "lstm_ppo": 1.0}
+    ensemble.kinds = {"xgboost": "forecast", "lstm_ppo": "policy"}
+    ensemble.is_fitted = True
+
+    exec_cfg = ExecutionConfig(
+        spread_bps=0.0, slippage_coeff=0.0, commission_bps=0.0,
+        borrow_rate_bps_annual=0.0, default_order_type="MOO",
+    )
+    cfg = TradingConfig(
+        initial_capital=10_000.0, position_size=0.1,
+        stop_loss=0.02, take_profit=0.05, execution=exec_cfg,
+    )
+    strat = TradingStrategy(
+        model=ensemble, config=cfg, sentiment_analyzer=None,
+        use_sentiment=False, execution_model=ExecutionModel(exec_cfg),
+    )
+
+    result = strat.run_segment(
+        data={"SYM": raw},
+        model_data={"SYM": scaled},
+        use_sentiment=False,
+    )
+
+    assert not result.empty
+    assert forecast.seen_close
+    assert policy.seen_close
+    assert max(v for seen in forecast.seen_close for v in seen) < 1.0
+    assert min(v for seen in policy.seen_close for v in seen) > 1.0
+
+
 # -- MLflow utility tests -----------------------------------------------------
 
 
@@ -435,6 +567,8 @@ def test_train_symbol_wfo_produces_per_fold_artifacts(monkeypatch, tmp_path):
     test_idx_sets = []
     for d in fold_dirs:
         assert (d / "ensemble_model").is_dir()
+        assert (d / "feature_engineer_state.pkl").exists()
+        assert (d / "fold_metadata.json").exists()
         sidx = np.load(d / "split_idx.npz")
         assert sidx["train_idx"].size > 0 and sidx["test_idx"].size > 0
         test_idx_sets.append(set(sidx["test_idx"].tolist()))
@@ -601,9 +735,19 @@ def test_backtest_wfo_swaps_model_per_fold(monkeypatch, tmp_path):
     ):
         d = fold_root / f"fold_{i}"
         (d / "ensemble_model").mkdir(parents=True, exist_ok=True)
+        train_idx = np.arange(0, 5)
         np.savez(
             d / "split_idx.npz",
-            train_idx=np.arange(0, 5), test_idx=test_slice,
+            train_idx=train_idx, test_idx=test_slice,
+        )
+        _write_fold_replay_artifacts(
+            d,
+            symbol="SYM",
+            horizon=5,
+            target_col="target_5",
+            usable=usable,
+            train_idx=train_idx,
+            test_idx=test_slice,
         )
         fold_dirs.append(d)
 
@@ -646,6 +790,86 @@ def test_backtest_wfo_swaps_model_per_fold(monkeypatch, tmp_path):
     assert load_calls == [1, 2], f"unexpected load order: {load_calls}"
     assert len(result["fold_metrics"]) == 3
     assert not result["equity_curve"].empty
+
+
+def test_fold_metadata_validates_replay_index(tmp_path):
+    from scripts.backtest import _fold_date_range
+    from scripts.training import build_features
+    from src.features import FeatureEngineer
+
+    raw = _make_gbm_df(n=90, seed=31)
+    fe = FeatureEngineer()
+    full_df = build_features(
+        raw_df=raw, symbol="SYM",
+        feature_engineer=fe, sentiment_analyzer=None, horizon=5,
+    )
+    usable = full_df.dropna(subset=["target_5"]).copy()
+    train_idx = np.concatenate([np.arange(0, 20), np.arange(25, 30)])
+    test_idx = np.arange(40, 60)
+    fold_dir = tmp_path / "fold_0"
+    fold_dir.mkdir()
+    np.savez(fold_dir / "split_idx.npz", train_idx=train_idx, test_idx=test_idx)
+    _write_fold_replay_artifacts(
+        fold_dir,
+        symbol="SYM",
+        horizon=5,
+        target_col="target_5",
+        usable=usable,
+        train_idx=train_idx,
+        test_idx=test_idx,
+    )
+
+    resolved = _fold_date_range(
+        fold_dir,
+        usable,
+        require_metadata=True,
+        symbol="SYM",
+        horizon=5,
+        target_col="target_5",
+    )
+    assert resolved == (usable.index[test_idx[0]], usable.index[test_idx[-1]])
+
+    drifted = usable.drop(index=usable.index[test_idx[3]])
+    with pytest.raises(ValueError, match="Test index missing|Test index hash mismatch"):
+        _fold_date_range(
+            fold_dir,
+            drifted,
+            require_metadata=True,
+            symbol="SYM",
+            horizon=5,
+            target_col="target_5",
+        )
+
+
+def test_missing_fold_metadata_fails_loud_for_ensemble_replay(tmp_path):
+    from scripts.backtest import _fold_date_range
+    from scripts.training import build_features
+    from src.features import FeatureEngineer
+
+    raw = _make_gbm_df(n=60, seed=32)
+    fe = FeatureEngineer()
+    full_df = build_features(
+        raw_df=raw, symbol="SYM",
+        feature_engineer=fe, sentiment_analyzer=None, horizon=5,
+    )
+    usable = full_df.dropna(subset=["target_5"]).copy()
+    fold_dir = tmp_path / "fold_0"
+    fold_dir.mkdir()
+    np.savez(
+        fold_dir / "split_idx.npz",
+        train_idx=np.arange(0, 20),
+        test_idx=np.arange(20, 30),
+    )
+
+    with pytest.raises(FileNotFoundError, match="R0 fold replay metadata"):
+        _fold_date_range(
+            fold_dir,
+            usable,
+            require_metadata=True,
+            symbol="SYM",
+            horizon=5,
+            target_col="target_5",
+        )
 
 
 def test_log_params_safe_coerces_to_strings(monkeypatch, tmp_path):

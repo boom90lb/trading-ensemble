@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Any, Mapping, Optional, Union
 
@@ -31,6 +32,8 @@ def init_mlflow(experiment_name: str) -> str:
     mlflow.start_run(experiment_id=…)`` (or rely on the default since
     ``set_experiment`` makes it implicit).
     """
+    if str(MLFLOW_TRACKING_URI).startswith("file://"):
+        os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     exp = mlflow.set_experiment(experiment_name)
     logger.info(

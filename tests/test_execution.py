@@ -15,7 +15,7 @@ import pandas as pd
 import pytest
 
 from src.config import ExecutionConfig, TradingConfig
-from src.execution import ExecutionModel, Order, OrderType
+from src.execution import ExecutionModel, Order, OrderType, backtest_target_weights
 from src.execution.costs import (
     commission_dollars,
     daily_borrow_dollars,
@@ -62,6 +62,89 @@ def test_daily_borrow_formula() -> None:
     assert got == pytest.approx(10_000.0 * 0.005 / 252)
 
 
+# ---------- target-weight portfolio accounting ----------
+
+
+def test_target_weights_same_side_rebalance_turnover() -> None:
+    idx = pd.date_range("2026-01-01", periods=4, freq="B")
+    opens = pd.DataFrame({"AAA": [100.0, 100.0, 100.0, 100.0]}, index=idx)
+    targets = pd.DataFrame({"AAA": [0.50, 0.80, 0.80, 0.80]}, index=idx)
+
+    result = _tw_result(opens, targets)
+
+    assert result.fill_weights.loc[idx[1], "AAA"] == pytest.approx(0.50)
+    assert result.fill_weights.loc[idx[2], "AAA"] == pytest.approx(0.80)
+    assert result.costs.loc[idx[1], "turnover"] == pytest.approx(0.50)
+    assert result.costs.loc[idx[2], "turnover"] == pytest.approx(0.30)
+
+
+def test_target_weights_sign_flip_is_net_turnover() -> None:
+    idx = pd.date_range("2026-01-01", periods=4, freq="B")
+    opens = pd.DataFrame({"AAA": [100.0, 100.0, 100.0, 100.0]}, index=idx)
+    targets = pd.DataFrame({"AAA": [0.50, -0.50, -0.50, -0.50]}, index=idx)
+
+    result = _tw_result(opens, targets)
+
+    assert result.fill_weights.loc[idx[1], "AAA"] == pytest.approx(0.50)
+    assert result.fill_weights.loc[idx[2], "AAA"] == pytest.approx(-0.50)
+    assert result.costs.loc[idx[2], "turnover"] == pytest.approx(1.00)
+
+
+def test_target_weights_rebalance_band_suppresses_small_trade() -> None:
+    idx = pd.date_range("2026-01-01", periods=4, freq="B")
+    opens = pd.DataFrame({"AAA": [100.0, 100.0, 100.0, 100.0]}, index=idx)
+    targets = pd.DataFrame({"AAA": [0.50, 0.52, 0.52, 0.52]}, index=idx)
+
+    result = _tw_result(opens, targets, rebalance_band_weight=0.05)
+
+    assert result.fill_weights.loc[idx[1], "AAA"] == pytest.approx(0.50)
+    assert result.fill_weights.loc[idx[2], "AAA"] == pytest.approx(0.50)
+    assert result.costs.loc[idx[2], "turnover"] == pytest.approx(0.0)
+
+
+def test_target_weights_dropped_fold_last_target_carries_filled_weight() -> None:
+    idx = pd.date_range("2026-01-01", periods=5, freq="B")
+    opens = pd.DataFrame({"AAA": [100.0, 100.0, 100.0, 100.0, 100.0]}, index=idx)
+    targets = pd.DataFrame(
+        {"AAA": [0.50, np.nan, -0.50, -0.50, -0.50]},
+        index=idx,
+    )
+
+    result = _tw_result(opens, targets)
+
+    assert result.fill_weights.loc[idx[1], "AAA"] == pytest.approx(0.50)
+    assert result.fill_weights.loc[idx[2], "AAA"] == pytest.approx(0.50)
+    assert result.fill_weights.loc[idx[3], "AAA"] == pytest.approx(-0.50)
+
+
+def test_target_weights_dividend_offsets_ex_date_open_markdown() -> None:
+    idx = pd.date_range("2026-01-01", periods=4, freq="B")
+    opens = pd.DataFrame({"AAA": [100.0, 100.0, 99.0, 99.0]}, index=idx)
+    targets = pd.DataFrame({"AAA": [1.0, 1.0, 1.0, 1.0]}, index=idx)
+    dividends = pd.DataFrame({"AAA": [0.0, 0.0, 1.0, 0.0]}, index=idx)
+
+    no_div = _tw_result(opens, targets)
+    with_div = _tw_result(opens, targets, dividends=dividends)
+
+    assert no_div.returns.loc[idx[1]] == pytest.approx(-0.01)
+    assert with_div.returns.loc[idx[1]] == pytest.approx(0.0)
+    assert with_div.costs.loc[idx[1], "dividend_return"] == pytest.approx(0.01)
+
+
+def test_target_weights_share_capital_across_symbols() -> None:
+    idx = pd.date_range("2026-01-01", periods=3, freq="B")
+    opens = pd.DataFrame(
+        {"AAA": [100.0, 100.0, 110.0], "BBB": [50.0, 50.0, 45.0]},
+        index=idx,
+    )
+    targets = pd.DataFrame({"AAA": [0.5, 0.5, 0.5], "BBB": [0.5, 0.5, 0.5]}, index=idx)
+
+    result = _tw_result(opens, targets)
+
+    assert result.fill_weights.loc[idx[1]].abs().sum() == pytest.approx(1.0)
+    assert result.returns.loc[idx[1]] == pytest.approx(0.5 * 0.10 + 0.5 * -0.10)
+
+
 # ---------- ExecutionModel: fill timing ----------
 
 
@@ -76,6 +159,20 @@ def _cfg(**kw) -> ExecutionConfig:
     )
     base.update(kw)
     return ExecutionConfig(**base)
+
+
+def _tw_result(
+    opens: pd.DataFrame,
+    targets: pd.DataFrame,
+    **kwargs,
+):
+    return backtest_target_weights(
+        opens,
+        targets,
+        execution=_cfg(),
+        initial_capital=10_000.0,
+        **kwargs,
+    )
 
 
 def test_moo_fills_at_next_bar_open() -> None:
@@ -137,6 +234,24 @@ def test_missing_symbol_keeps_order_queued() -> None:
     )
     assert fills == []
     assert em.pending_count() == 1
+
+
+def test_missing_symbol_fills_at_first_later_available_bar() -> None:
+    em = ExecutionModel(_cfg())
+    em.submit(Order("AAA", side=1, shares=1.0, order_type=OrderType.MOO, submit_bar=0))
+
+    assert em.step(
+        bar_idx=1,
+        bar_ohlc={"BBB": {"open": 50.0, "close": 50.0}},
+        portfolio_value=10_000.0,
+    ) == []
+    assert em.pending_count() == 1
+
+    fills = em.step(bar_idx=3, bar_ohlc=_bar(101.0, 102.0), portfolio_value=10_000.0)
+    assert len(fills) == 1
+    assert fills[0].fill_bar == 3
+    assert fills[0].fill_price == 101.0
+    assert em.pending_count() == 0
 
 
 def test_drop_pending_clears_queue() -> None:

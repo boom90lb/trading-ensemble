@@ -7,11 +7,17 @@ covers operational gotchas.
 ## Data flow
 
 ```
-Twelvedata API ──► DataLoader ──► FeatureEngineer ──► PurgedWalkForward ──► EnsembleModel ──► TradingStrategy ──► report
-   (1day bars,      (range-keyed     (technical         (AFML §7.4          (forecast +        (signal→order→
-    adjust=splits)   parquet cache)   indicators,        purge+embargo)      policy members,    fill@next-open,
-                                      train-only clip)                       vol-sized blend)    costs, borrow)
+Twelvedata API ──► DataLoader ──► FeatureEngineer ──► PurgedWalkForward ──► EnsembleModel ──► TradingStrategy ──► target-weight engine ──► claim packet
+   (1day bars,      (range-keyed     (technical         (AFML §7.4          (forecast +        (close-time        (next-open fills,
+    adjust=splits)   parquet cache)   indicators,        purge+embargo)      policy members,    target weights)    costs, borrow)
+                                      train-only clip)                       vol-sized blend)
 ```
+
+The default directional WFO backtest uses `TradingStrategy` only to generate
+continuous close-time target weights from per-fold ensemble models. Portfolio
+accounting then happens once across all symbols in `src/execution/target_weights.py`.
+The legacy `--legacy_orders` path still uses `TradingStrategy.run_segment` and
+`ExecutionModel` directly for per-symbol LONG/SHORT/FLAT order accounting.
 
 The statistical-arbitrage path is intentionally separate:
 
@@ -61,19 +67,33 @@ close/open matrix ──► rolling formation/test folds ──► train-only pa
   - `predict_band` / `update_aci` provide EnbPI+ACI conformal bands.
 
 ### 5. Execution + accounting — `src/execution/`, `src/trading.py`
-- `ExecutionModel` queues `Order`s and fills them at **t+1** (MOO at open, MOC
-  at close — never same-bar), applying half-spread + linear impact slippage,
-  bps commission, and daily borrow on shorts (`costs.py`).
-- `TradingStrategy.run_segment` is the per-bar loop: predict → `calculate_signal`
-  (position sign → LONG/SHORT/FLAT; magnitude + inter-model agreement + conformal
-  band width → confidence) → `submit_signal_order` → next-bar fill → mark-to-
-  market → borrow → record. `backtest` = `_reset_state → run_segment →
-  drop_pending → _finalize_results`; the WFO loops call the primitives directly.
+- `target_weights.py` is the default portfolio accounting path. It accepts
+  close-time target weights, fills them at the next open, suppresses small
+  rebalances by weight band, drops fold-last pending targets, carries existing
+  filled weights across folds, row-scales gross exposure, applies spread,
+  commission, impact, borrow, and dividend return contribution, and emits
+  `target_weights`, `fill_weights`, `costs`, returns, equity, and metrics.
+- `TradingStrategy.generate_target_weight_segment` is the default WFO signal
+  surface: it replays each fold's saved feature state, feeds forecast members
+  fold-scaled features and policy members raw OHLCV windows, and converts the
+  ensemble position to `position_size * position`.
+- `ExecutionModel` remains the legacy order engine. It queues `Order`s and fills
+  them at **t+1** (MOO at open, MOC at close — never same-bar), applying
+  half-spread + linear impact slippage, bps commission, and daily borrow on
+  shorts (`costs.py`).
+- `TradingStrategy.run_segment` is the legacy per-bar loop: predict →
+  `calculate_signal` (position sign → LONG/SHORT/FLAT; magnitude +
+  inter-model agreement + conformal band width → confidence) →
+  `submit_signal_order` → next-bar fill → mark-to-market → borrow → record.
+  `backtest` = `_reset_state → run_segment → drop_pending → _finalize_results`.
 
 ### 6. Evaluation — `src/validation/metrics.py`, `src/baselines/`
 - `metrics.py`: PSR, PBO (CSCV), DSR (False Strategy Theorem), Calmar.
-- `baselines/`: BuyAndHold, MACrossover, TSMOM — run through the same execution
-  path so PBO is computed across a fold-aligned strategy set.
+- `validation/trials.py`: canonical research claim packets with config hash,
+  code commit, data convention, artifact manifest, gross/net/cost metrics,
+  DSR/trial count when available, and claim tier.
+- `baselines/`: BuyAndHold, MACrossover, TSMOM — used by the legacy order-mode
+  comparison path so PBO is computed across a fold-aligned strategy set.
 - `conformal/`: EnbPI block-cross-conformal + ACI online α-adaptation.
 
 ### 7. Statistical arbitrage — `src/arbitrage/`, `scripts/stat_arb*.py`
@@ -81,9 +101,8 @@ close/open matrix ──► rolling formation/test folds ──► train-only pa
   Benjamini-Hochberg FDR control, half-life and beta-drift filters, and causal
   spread-z target generation. The report variant also records raw candidates,
   the FDR cutoff, and rejection counts.
-- `portfolio.py`: combines pair target weights under gross/per-symbol caps and
-  backtests close-time targets with next-open fills, spread, commission, impact,
-  and borrow.
+- `portfolio.py`: compatibility exports for the shared target-weight portfolio
+  accounting in `src/execution/target_weights.py`.
 - `walk_forward.py`: rolls formation/test windows, freezes selected pairs per
   fold, forces fold-end targets flat, records pair turnover and fold metrics,
   and reports `pair_set_dsr` from selected pair-book trial Sharpes.
@@ -95,7 +114,7 @@ close/open matrix ──► rolling formation/test folds ──► train-only pa
 | Script | Role | Key output |
 |---|---|---|
 | `training.py` | per-symbol purged-WFO fit | `runs/{run}/{symbol}/fold_*/ensemble_model/` + `split_idx.npz` |
-| `backtest.py` | replay per-fold models, net WFO-OOS + baselines + PBO/DSR | `results/wfo_backtest_*/summary.json` |
+| `backtest.py` | default shared-capital target-weight WFO; optional legacy order-mode baselines + PBO/DSR | root `claim_packet.json`, target/fill/cost/equity CSVs, `summary.json` |
 | `sweep.py` | ensemble-layer grid → honest DSR (forecast-only) | `trial_sharpes.json`, `selected_config.json` |
 | `rl_seed_eval.py` | multi-seed RL overfitting study | `rl_seed_eval.json` |
 | `stat_arb.py` | train-only cointegration scan → market-neutral pair portfolio | `pairs.json`, `summary.json`, weights/costs CSVs |
@@ -117,6 +136,9 @@ installs console+rotating-file logging.
   mapped before blending (the B8 fix); never average ŷ with positions.
 - **Members can be silently dropped from the blend** if `predict` returns a
   length ≠ `len(X)` — currently the forecast `lstm`. See `docs/operations.md`.
+- **Directional WFO is now portfolio-level by default.** A strategy claiming a
+  directional ensemble result should point to the root target/fill/cost/equity
+  artifacts and `claim_packet.json`, not only per-symbol logs.
 - **Arbitrage logic lives in `src/arbitrage/`**, not in the directional
   ensemble. A strategy claiming arbitrage should produce cross-asset hedged
   target weights and portfolio-level PnL, not independent symbol signals.

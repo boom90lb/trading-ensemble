@@ -12,6 +12,7 @@ Split into:
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 
 import mlflow
@@ -27,6 +28,25 @@ from scripts.sweep import (
     summarize_sweep,
 )
 from src.validation.metrics import periodic_sharpe, probabilistic_sharpe_ratio
+from src.validation.trials import CLAIM_TIERS, validate_claim_packet_dir
+
+
+def test_r0_quarantine_defaults_and_explicit_rejections(monkeypatch) -> None:
+    import scripts.sweep as sweep_mod
+    from scripts.training import (
+        DEFAULT_MODEL_SELECTION,
+        parse_model_names,
+        reject_sentiment_flag,
+    )
+
+    assert "lstm" not in parse_model_names(DEFAULT_MODEL_SELECTION)
+    monkeypatch.setattr(sys, "argv", ["sweep.py"])
+    assert parse_model_names(sweep_mod.parse_args().models) == ["xgboost"]
+
+    with pytest.raises(ValueError, match="forecast LSTM is disabled"):
+        parse_model_names("xgboost,lstm")
+    with pytest.raises(ValueError, match="sentiment is disabled"):
+        reject_sentiment_flag(True, surface="training")
 
 
 def _make_gbm_df(n: int, seed: int = 0, start: str = "2024-01-02") -> pd.DataFrame:
@@ -222,3 +242,13 @@ def test_run_sweep_end_to_end(monkeypatch, tmp_path) -> None:
         assert summary["dsr"] <= summary["psr"] + 1e-9
         assert summary["selected_config"] is not None
         assert (out_dir / "selected_config.json").exists()
+
+    # A claim packet is emitted + self-consistent whenever a config is selected.
+    if summary.get("selected_config") is not None:
+        assert (out_dir / "claim_packet.json").exists()
+        assert summary["claim_tier"] in CLAIM_TIERS
+        assert summary["config_hash"]
+        assert summary["claim_packet"] == "claim_packet.json"
+        packet = validate_claim_packet_dir(out_dir)
+        assert packet["strategy"] == "ensemble_hparam_sweep"
+        assert packet["metrics"]["trial_count"] == summary["n_valid"]

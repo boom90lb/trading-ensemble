@@ -2,7 +2,9 @@
 """Feature engineering for the time series ensemble model using NNX."""
 
 import logging
-from typing import Dict, List, Optional
+import pickle
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import flax.nnx as nnx
 import numpy as np
@@ -109,6 +111,194 @@ class FeatureEngineer(nnx.Module):
         # fit_scalers and reused in transform_features so test-time clipping
         # never consumes test-set statistics.
         self.clip_bounds: Dict[str, Dict[str, tuple]] = {}
+        # Column groups fitted per symbol. Transform uses these exact groups so
+        # feature drift fails before it can silently pad/truncate scaler params.
+        self.fitted_columns: Dict[str, Dict[str, List[str]]] = {}
+
+    @staticmethod
+    def _column_groups(df: pd.DataFrame) -> Dict[str, List[str]]:
+        """Return the feature groups used by fit/transform."""
+        price_cols = [
+            col
+            for col in df.columns
+            if col.lower() in ["open", "high", "low", "close"] or col.startswith("ma") or col.startswith("ema")
+        ]
+        volume_cols = [col for col in df.columns if "volume" in col.lower()]
+        technical_cols = [
+            col
+            for col in df.select_dtypes(include=["number"]).columns
+            if col not in price_cols
+            and col not in volume_cols
+            and not col.startswith("target_")
+            and not col.startswith("direction_")
+            and not col.startswith("pct_change_")
+        ]
+        sentiment_cols = [col for col in df.columns if "sentiment" in col.lower()]
+        return {
+            "price": price_cols,
+            "volume": volume_cols,
+            "technical": technical_cols,
+            "sentiment": sentiment_cols,
+        }
+
+    @staticmethod
+    def _scaler_state(scaler: ScalerModule) -> Dict[str, Any]:
+        return {
+            "scaler_type": scaler.scaler_type,
+            "is_fitted": bool(scaler.is_fitted.value),
+            "mean": np.asarray(scaler.mean.value, dtype=float),
+            "std": np.asarray(scaler.std.value, dtype=float),
+            "min_vals": np.asarray(scaler.min_vals.value, dtype=float),
+            "max_vals": np.asarray(scaler.max_vals.value, dtype=float),
+        }
+
+    @staticmethod
+    def _scaler_from_state(state: Dict[str, Any]) -> ScalerModule:
+        scaler = ScalerModule(scaler_type=str(state["scaler_type"]))
+        scaler.is_fitted.value = bool(state["is_fitted"])
+        scaler.mean.value = np.asarray(state["mean"], dtype=float)
+        scaler.std.value = np.asarray(state["std"], dtype=float)
+        scaler.min_vals.value = np.asarray(state["min_vals"], dtype=float)
+        scaler.max_vals.value = np.asarray(state["max_vals"], dtype=float)
+        return scaler
+
+    def to_plain_state(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        feature_columns: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Serialize fitted scaler state without depending on NNX internals."""
+        symbols = [symbol] if symbol is not None else sorted(
+            set(self.price_scalers)
+            | set(self.volume_scalers)
+            | set(self.technical_scalers)
+            | set(self.sentiment_scalers)
+            | set(self.clip_bounds)
+            | set(self.fitted_columns)
+        )
+
+        def pick(store: Dict[str, ScalerModule]) -> Dict[str, Dict[str, Any]]:
+            return {
+                sym: self._scaler_state(store[sym])
+                for sym in symbols
+                if sym in store
+            }
+
+        return {
+            "schema_version": 1,
+            "price_scaler_type": self.price_scaler_type,
+            "volume_scaler_type": self.volume_scaler_type,
+            "technical_scaler_type": self.technical_scaler_type,
+            "sentiment_scaler_type": self.sentiment_scaler_type,
+            "price_scalers": pick(self.price_scalers),
+            "volume_scalers": pick(self.volume_scalers),
+            "technical_scalers": pick(self.technical_scalers),
+            "sentiment_scalers": pick(self.sentiment_scalers),
+            "clip_bounds": {
+                sym: dict(self.clip_bounds.get(sym, {}))
+                for sym in symbols
+                if sym in self.clip_bounds
+            },
+            "fitted_columns": {
+                sym: {
+                    group: list(cols)
+                    for group, cols in self.fitted_columns.get(sym, {}).items()
+                }
+                for sym in symbols
+                if sym in self.fitted_columns
+            },
+            "feature_columns": list(feature_columns) if feature_columns is not None else None,
+        }
+
+    @classmethod
+    def from_plain_state(cls, state: Dict[str, Any]) -> "FeatureEngineer":
+        """Rehydrate a FeatureEngineer from :meth:`to_plain_state` output."""
+        if int(state.get("schema_version", 0)) != 1:
+            raise ValueError(
+                f"Unsupported FeatureEngineer state schema: {state.get('schema_version')}"
+            )
+        fe = cls(
+            price_scaler=str(state["price_scaler_type"]),
+            volume_scaler=str(state["volume_scaler_type"]),
+            technical_scaler=str(state["technical_scaler_type"]),
+            sentiment_scaler=str(state["sentiment_scaler_type"]),
+        )
+        for sym, scaler_state in state.get("price_scalers", {}).items():
+            fe.price_scalers[sym] = cls._scaler_from_state(scaler_state)
+        for sym, scaler_state in state.get("volume_scalers", {}).items():
+            fe.volume_scalers[sym] = cls._scaler_from_state(scaler_state)
+        for sym, scaler_state in state.get("technical_scalers", {}).items():
+            fe.technical_scalers[sym] = cls._scaler_from_state(scaler_state)
+        for sym, scaler_state in state.get("sentiment_scalers", {}).items():
+            fe.sentiment_scalers[sym] = cls._scaler_from_state(scaler_state)
+        fe.clip_bounds = {
+            sym: {col: tuple(bounds) for col, bounds in bounds_by_col.items()}
+            for sym, bounds_by_col in state.get("clip_bounds", {}).items()
+        }
+        fe.fitted_columns = {
+            sym: {group: list(cols) for group, cols in groups.items()}
+            for sym, groups in state.get("fitted_columns", {}).items()
+        }
+        return fe
+
+    def save_state(
+        self,
+        path: Path,
+        *,
+        symbol: Optional[str] = None,
+        feature_columns: Optional[List[str]] = None,
+    ) -> None:
+        """Persist plain fold feature state to ``path``."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(
+                self.to_plain_state(symbol=symbol, feature_columns=feature_columns),
+                f,
+            )
+
+    @classmethod
+    def load_state(cls, path: Path) -> "FeatureEngineer":
+        """Load plain fold feature state written by :meth:`save_state`."""
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        return cls.from_plain_state(state)
+
+    @staticmethod
+    def _check_required_columns(
+        df: pd.DataFrame,
+        *,
+        symbol: str,
+        group_name: str,
+        columns: List[str],
+    ) -> None:
+        missing = [col for col in columns if col not in df.columns]
+        if missing:
+            raise ValueError(
+                f"{symbol} {group_name} feature columns missing at transform: {missing}"
+            )
+
+    @staticmethod
+    def _check_scaler_shape(
+        scaler: ScalerModule,
+        *,
+        symbol: str,
+        group_name: str,
+        n_columns: int,
+    ) -> None:
+        if not bool(scaler.is_fitted.value):
+            return
+        if scaler.scaler_type == "minmax":
+            fitted = int(np.asarray(scaler.min_vals.value).shape[0])
+        elif scaler.scaler_type == "standard":
+            fitted = int(np.asarray(scaler.mean.value).shape[0])
+        else:
+            return
+        if fitted != n_columns:
+            raise ValueError(
+                f"{symbol} {group_name} scaler shape mismatch: "
+                f"state has {fitted} columns, transform has {n_columns}"
+            )
 
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create technical indicators and features.
@@ -320,26 +510,15 @@ class FeatureEngineer(nnx.Module):
             symbol: Symbol for the data
         """
         try:
-            # Get column groups
-            price_cols = [
-                col
-                for col in df.columns
-                if col.lower() in ["open", "high", "low", "close"] or col.startswith("ma") or col.startswith("ema")
-            ]
-
-            volume_cols = [col for col in df.columns if "volume" in col.lower()]
-
-            technical_cols = [
-                col
-                for col in df.select_dtypes(include=["number"]).columns
-                if col not in price_cols
-                and col not in volume_cols
-                and not col.startswith("target_")
-                and not col.startswith("direction_")
-                and not col.startswith("pct_change_")
-            ]
-
-            sentiment_cols = [col for col in df.columns if "sentiment" in col.lower()]
+            groups = self._column_groups(df)
+            price_cols = groups["price"]
+            volume_cols = groups["volume"]
+            technical_cols = groups["technical"]
+            sentiment_cols = groups["sentiment"]
+            self.fitted_columns[symbol] = {
+                group: list(cols)
+                for group, cols in groups.items()
+            }
 
             # Train-only clip bounds for this symbol (overwritten on re-fit).
             symbol_bounds: Dict[str, tuple] = {}
@@ -426,6 +605,7 @@ class FeatureEngineer(nnx.Module):
 
         except Exception as e:
             logger.error(f"Error fitting scalers for {symbol}: {e}")
+            raise
 
     def transform_features(self, df: pd.DataFrame, symbol: str, is_train: bool = False) -> pd.DataFrame:
         """Transform features using fitted NNX scalers with improved handling of outliers and NaNs.
@@ -439,324 +619,101 @@ class FeatureEngineer(nnx.Module):
             DataFrame with transformed features
         """
         result = df.copy()
+        groups = self.fitted_columns.get(symbol, self._column_groups(df))
+        price_cols = list(groups.get("price", []))
+        volume_cols = list(groups.get("volume", []))
+        technical_cols = list(groups.get("technical", []))
+        sentiment_cols = list(groups.get("sentiment", []))
 
-        try:
-            # Apply train-only outlier-clip bounds recorded in fit_scalers. Columns
-            # without a stored bound (e.g., not present at fit time or fit was
-            # never called for this symbol) pass through unclipped — recomputing
-            # mean/std from `result` would leak test-set statistics into the
-            # transform, which is the B9-adjacent leak this block used to have.
-            symbol_bounds = self.clip_bounds.get(symbol, {})
-            for col, (lo, hi) in symbol_bounds.items():
-                if col in result.columns:
-                    result[col] = result[col].clip(lo, hi)
+        # Apply train-only outlier-clip bounds recorded in fit_scalers. Columns
+        # without a stored bound pass through unclipped; missing fitted columns
+        # are handled by the group-specific strict checks below.
+        symbol_bounds = self.clip_bounds.get(symbol, {})
+        for col, (lo, hi) in symbol_bounds.items():
+            if col in result.columns:
+                result[col] = result[col].clip(lo, hi)
 
-            # Get column groups
-            price_cols = [
-                col
-                for col in df.columns
-                if col.lower() in ["open", "high", "low", "close"] or col.startswith("ma") or col.startswith("ema")
-            ]
+        if symbol in self.price_scalers and price_cols:
+            self._check_required_columns(
+                result, symbol=symbol, group_name="price", columns=price_cols,
+            )
+            price_scaler = self.price_scalers[symbol]
+            result[price_cols] = (
+                result[price_cols]
+                .replace([np.inf, -np.inf], np.nan)
+                .ffill()
+                .fillna(0)
+            )
+            price_data_np = result[price_cols].values
+            self._check_scaler_shape(
+                price_scaler, symbol=symbol, group_name="price",
+                n_columns=price_data_np.shape[1],
+            )
+            result[price_cols] = price_scaler.transform(price_data_np)
 
-            volume_cols = [col for col in df.columns if "volume" in col.lower()]
+        if symbol in self.volume_scalers and volume_cols:
+            self._check_required_columns(
+                result, symbol=symbol, group_name="volume", columns=volume_cols,
+            )
+            volume_scaler = self.volume_scalers[symbol]
+            for col in volume_cols:
+                result[col] = np.log1p(
+                    result[col].replace([np.inf, -np.inf, 0], np.nan).fillna(1)
+                )
+            result[volume_cols] = result[volume_cols].ffill().fillna(0)
+            volume_data_np = result[volume_cols].values
+            self._check_scaler_shape(
+                volume_scaler, symbol=symbol, group_name="volume",
+                n_columns=volume_data_np.shape[1],
+            )
+            result[volume_cols] = volume_scaler.transform(volume_data_np)
 
-            technical_cols = [
-                col
-                for col in df.select_dtypes(include=["number"]).columns
-                if col not in price_cols
-                and col not in volume_cols
-                and not col.startswith("target_")
-                and not col.startswith("direction_")
-                and not col.startswith("pct_change_")
-            ]
+        if symbol in self.technical_scalers and technical_cols:
+            self._check_required_columns(
+                result, symbol=symbol, group_name="technical",
+                columns=technical_cols,
+            )
+            technical_scaler = self.technical_scalers[symbol]
+            result[technical_cols] = (
+                result[technical_cols]
+                .replace([np.inf, -np.inf], np.nan)
+                .ffill()
+                .fillna(0)
+            )
+            technical_data_np = result[technical_cols].values
+            self._check_scaler_shape(
+                technical_scaler, symbol=symbol, group_name="technical",
+                n_columns=technical_data_np.shape[1],
+            )
+            result[technical_cols] = technical_scaler.transform(technical_data_np)
 
-            sentiment_cols = [col for col in df.columns if "sentiment" in col.lower()]
+        if symbol in self.sentiment_scalers and sentiment_cols:
+            self._check_required_columns(
+                result, symbol=symbol, group_name="sentiment",
+                columns=sentiment_cols,
+            )
+            sentiment_scaler = self.sentiment_scalers[symbol]
+            result[sentiment_cols] = (
+                result[sentiment_cols]
+                .replace([np.inf, -np.inf], np.nan)
+                .ffill()
+                .fillna(0)
+            )
+            sentiment_data_np = result[sentiment_cols].values
+            self._check_scaler_shape(
+                sentiment_scaler, symbol=symbol, group_name="sentiment",
+                n_columns=sentiment_data_np.shape[1],
+            )
+            result[sentiment_cols] = sentiment_scaler.transform(sentiment_data_np)
 
-            # Transform price features
-            if symbol in self.price_scalers and price_cols:
-                price_scaler = self.price_scalers[symbol]
-                # Use forward fill then backward fill to handle NaNs more robustly
-                result[price_cols] = result[price_cols].ffill().bfill()
-                # Replace any remaining NaNs or infs with 0
-                result[price_cols] = result[price_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+        result = result.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
 
-                # Check if data exists before transforming
-                if not result[price_cols].empty:
-                    # Convert to numpy array for NNX scaler
-                    price_data_np = result[price_cols].values
-                    # Log shapes for debugging
-                    logger.info(f"Transform - Price data shape for {symbol}: {price_data_np.shape}")
-                    logger.info(f"Transform - Price scaler min_vals shape: {price_scaler.min_vals.value.shape}")
-
-                    # Ensure compatible shapes
-                    if price_data_np.shape[1] != price_scaler.min_vals.value.shape[0]:
-                        logger.warning(f"Shape mismatch in price data for {symbol}. Adjusting scaler parameters.")
-                        # Adjust scaler parameters to match the data shape
-                        if price_scaler.scaler_type == "minmax":
-                            # Extend or truncate min_vals and max_vals to match data shape
-                            cols = price_data_np.shape[1]
-                            current_vals = price_scaler.min_vals.value.shape[0]
-
-                            if cols > current_vals:
-                                # Extend with zeros/ones
-                                price_scaler.min_vals.value = np.pad(
-                                    price_scaler.min_vals.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=0,
-                                )
-                                price_scaler.max_vals.value = np.pad(
-                                    price_scaler.max_vals.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=1,
-                                )
-                            else:
-                                # Truncate
-                                price_scaler.min_vals.value = price_scaler.min_vals.value[:cols]
-                                price_scaler.max_vals.value = price_scaler.max_vals.value[:cols]
-                        elif price_scaler.scaler_type == "standard":
-                            # Extend or truncate mean and std to match data shape
-                            cols = price_data_np.shape[1]
-                            current_vals = price_scaler.mean.value.shape[0]
-
-                            if cols > current_vals:
-                                # Extend with zeros/ones
-                                price_scaler.mean.value = np.pad(
-                                    price_scaler.mean.value, (0, cols - current_vals), "constant", constant_values=0
-                                )
-                                price_scaler.std.value = np.pad(
-                                    price_scaler.std.value, (0, cols - current_vals), "constant", constant_values=1
-                                )
-                            else:
-                                # Truncate
-                                price_scaler.mean.value = price_scaler.mean.value[:cols]
-                                price_scaler.std.value = price_scaler.std.value[:cols]
-
-                    transformed_data = price_scaler.transform(price_data_np)
-                    result[price_cols] = transformed_data
-
-            # Transform volume features
-            if symbol in self.volume_scalers and volume_cols:
-                volume_scaler = self.volume_scalers[symbol]
-                # Apply same log transform as in fitting
-                for col in volume_cols:
-                    if col in result.columns:
-                        result[col] = np.log1p(result[col].replace([np.inf, -np.inf, 0], np.nan).fillna(1))
-
-                # Handle NaNs
-                result[volume_cols] = result[volume_cols].ffill().bfill().fillna(0)
-
-                # Check if data exists before transforming
-                if not result[volume_cols].empty:
-                    # Convert to numpy array for NNX scaler
-                    volume_data_np = result[volume_cols].values
-                    # Log shapes for debugging
-                    logger.info(f"Transform - Volume data shape for {symbol}: {volume_data_np.shape}")
-                    logger.info(f"Transform - Volume scaler min_vals shape: {volume_scaler.min_vals.value.shape}")
-
-                    # Ensure compatible shapes
-                    if volume_data_np.shape[1] != volume_scaler.min_vals.value.shape[0]:
-                        logger.warning(f"Shape mismatch in volume data for {symbol}. Adjusting scaler parameters.")
-                        # Adjust scaler parameters to match the data shape
-                        if volume_scaler.scaler_type == "minmax":
-                            # Extend or truncate min_vals and max_vals to match data shape
-                            cols = volume_data_np.shape[1]
-                            current_vals = volume_scaler.min_vals.value.shape[0]
-
-                            if cols > current_vals:
-                                # Extend with zeros/ones
-                                volume_scaler.min_vals.value = np.pad(
-                                    volume_scaler.min_vals.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=0,
-                                )
-                                volume_scaler.max_vals.value = np.pad(
-                                    volume_scaler.max_vals.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=1,
-                                )
-                            else:
-                                # Truncate
-                                volume_scaler.min_vals.value = volume_scaler.min_vals.value[:cols]
-                                volume_scaler.max_vals.value = volume_scaler.max_vals.value[:cols]
-                        elif volume_scaler.scaler_type == "standard":
-                            # Extend or truncate mean and std to match data shape
-                            cols = volume_data_np.shape[1]
-                            current_vals = volume_scaler.mean.value.shape[0]
-
-                            if cols > current_vals:
-                                # Extend with zeros/ones
-                                volume_scaler.mean.value = np.pad(
-                                    volume_scaler.mean.value, (0, cols - current_vals), "constant", constant_values=0
-                                )
-                                volume_scaler.std.value = np.pad(
-                                    volume_scaler.std.value, (0, cols - current_vals), "constant", constant_values=1
-                                )
-                            else:
-                                # Truncate
-                                volume_scaler.mean.value = volume_scaler.mean.value[:cols]
-                                volume_scaler.std.value = volume_scaler.std.value[:cols]
-
-                    transformed_data = volume_scaler.transform(volume_data_np)
-                    result[volume_cols] = transformed_data
-
-            # Transform technical features
-            if symbol in self.technical_scalers and technical_cols:
-                technical_scaler = self.technical_scalers[symbol]
-                # Handle NaNs
-                result[technical_cols] = result[technical_cols].ffill().bfill().fillna(0)
-                # Replace any remaining infs
-                result[technical_cols] = result[technical_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-
-                # Check if data exists before transforming
-                if not result[technical_cols].empty:
-                    # Convert to numpy array for NNX scaler
-                    technical_data_np = result[technical_cols].values
-                    # Log shapes for debugging
-                    logger.info(f"Transform - Technical data shape for {symbol}: {technical_data_np.shape}")
-                    logger.info(
-                        f"Transform - Technical scaler min_vals shape: {technical_scaler.min_vals.value.shape}"
-                    )
-                    logger.info(
-                        f"Transform - Technical scaler max_vals shape: {technical_scaler.max_vals.value.shape}"
-                    )
-
-                    # Ensure compatible shapes
-                    if technical_data_np.shape[1] != technical_scaler.min_vals.value.shape[0]:
-                        logger.warning(f"Shape mismatch in technical data for {symbol}. Adjusting scaler parameters.")
-                        # Adjust scaler parameters to match the data shape
-                        if technical_scaler.scaler_type == "minmax":
-                            # Extend or truncate min_vals and max_vals to match data shape
-                            cols = technical_data_np.shape[1]
-                            current_vals = technical_scaler.min_vals.value.shape[0]
-
-                            if cols > current_vals:
-                                # Extend with zeros/ones
-                                technical_scaler.min_vals.value = np.pad(
-                                    technical_scaler.min_vals.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=0,
-                                )
-                                technical_scaler.max_vals.value = np.pad(
-                                    technical_scaler.max_vals.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=1,
-                                )
-                            else:
-                                # Truncate
-                                technical_scaler.min_vals.value = technical_scaler.min_vals.value[:cols]
-                                technical_scaler.max_vals.value = technical_scaler.max_vals.value[:cols]
-                        elif technical_scaler.scaler_type == "standard":
-                            # Extend or truncate mean and std to match data shape
-                            cols = technical_data_np.shape[1]
-                            current_vals = technical_scaler.mean.value.shape[0]
-
-                            if cols > current_vals:
-                                # Extend with zeros/ones
-                                technical_scaler.mean.value = np.pad(
-                                    technical_scaler.mean.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=0,
-                                )
-                                technical_scaler.std.value = np.pad(
-                                    technical_scaler.std.value, (0, cols - current_vals), "constant", constant_values=1
-                                )
-                            else:
-                                # Truncate
-                                technical_scaler.mean.value = technical_scaler.mean.value[:cols]
-                                technical_scaler.std.value = technical_scaler.std.value[:cols]
-
-                    transformed_data = technical_scaler.transform(technical_data_np)
-                    result[technical_cols] = transformed_data
-
-            # Transform sentiment features
-            if symbol in self.sentiment_scalers and sentiment_cols:
-                sentiment_scaler = self.sentiment_scalers[symbol]
-                result[sentiment_cols] = result[sentiment_cols].fillna(0)  # Fill sentiment NaNs with 0
-
-                # Check if data exists before transforming
-                if not result[sentiment_cols].empty:
-                    # Convert to numpy array for NNX scaler
-                    sentiment_data_np = result[sentiment_cols].values
-                    # Log shapes for debugging
-                    logger.info(f"Transform - Sentiment data shape for {symbol}: {sentiment_data_np.shape}")
-                    logger.info(
-                        f"Transform - Sentiment scaler min_vals shape: {sentiment_scaler.min_vals.value.shape}"
-                    )
-
-                    # Ensure compatible shapes
-                    if sentiment_data_np.shape[1] != sentiment_scaler.min_vals.value.shape[0]:
-                        logger.warning(f"Shape mismatch in sentiment data for {symbol}. Adjusting scaler parameters.")
-                        # Adjust scaler parameters to match the data shape
-                        if sentiment_scaler.scaler_type == "minmax":
-                            # Extend or truncate min_vals and max_vals to match data shape
-                            cols = sentiment_data_np.shape[1]
-                            current_vals = sentiment_scaler.min_vals.value.shape[0]
-
-                            if cols > current_vals:
-                                # Extend with zeros/ones
-                                sentiment_scaler.min_vals.value = np.pad(
-                                    sentiment_scaler.min_vals.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=0,
-                                )
-                                sentiment_scaler.max_vals.value = np.pad(
-                                    sentiment_scaler.max_vals.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=1,
-                                )
-                            else:
-                                # Truncate
-                                sentiment_scaler.min_vals.value = sentiment_scaler.min_vals.value[:cols]
-                                sentiment_scaler.max_vals.value = sentiment_scaler.max_vals.value[:cols]
-                        elif sentiment_scaler.scaler_type == "standard":
-                            # Extend or truncate mean and std to match data shape
-                            cols = sentiment_data_np.shape[1]
-                            current_vals = sentiment_scaler.mean.value.shape[0]
-
-                            if cols > current_vals:
-                                # Extend with zeros/ones
-                                sentiment_scaler.mean.value = np.pad(
-                                    sentiment_scaler.mean.value,
-                                    (0, cols - current_vals),
-                                    "constant",
-                                    constant_values=0,
-                                )
-                                sentiment_scaler.std.value = np.pad(
-                                    sentiment_scaler.std.value, (0, cols - current_vals), "constant", constant_values=1
-                                )
-                            else:
-                                # Truncate
-                                sentiment_scaler.mean.value = sentiment_scaler.mean.value[:cols]
-                                sentiment_scaler.std.value = sentiment_scaler.std.value[:cols]
-
-                    transformed_data = sentiment_scaler.transform(sentiment_data_np)
-                    result[sentiment_cols] = transformed_data
-
-            # Final NaN/inf check across all columns
-            result = result.replace([np.inf, -np.inf], np.nan)
-            # Forward fill, backward fill, then zero for any remaining NaNs
-            result = result.ffill().bfill().fillna(0)
-
-            # Add additional RL-specific normalization for better training stability
-            if is_train:
-                # Ensure important features for RL have consistent ranges
-                important_cols = ["rsi_14", "macd", "bb_width", "volatility_20", "price_change", "volume_change"]
-                for col in important_cols:
-                    if col in result.columns and result[col].std() > 0:
-                        # Additional normalization for key RL features if needed
-                        if result[col].std() > 1.5 or result[col].std() < 0.1:
-                            result[col] = (result[col] - result[col].mean()) / (result[col].std() + 1e-8)
-
-        except Exception as e:
-            logger.error(f"Error transforming features for {symbol}: {e}")
+        if is_train:
+            # Preserve the existing train-only RL stabilization behavior.
+            important_cols = ["rsi_14", "macd", "bb_width", "volatility_20", "price_change", "volume_change"]
+            for col in important_cols:
+                if col in result.columns and result[col].std() > 0:
+                    if result[col].std() > 1.5 or result[col].std() < 0.1:
+                        result[col] = (result[col] - result[col].mean()) / (result[col].std() + 1e-8)
 
         return result

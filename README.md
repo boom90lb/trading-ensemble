@@ -5,7 +5,8 @@ A research backtesting stack that combines classical time-series forecasters
 (LSTM-PPO, xLSTM-PPO, xLSTM-GRPO) into a single position-space ensemble, then
 evaluates it under a **methodology designed to produce honest out-of-sample
 numbers** — purged walk-forward CV, next-open fills with realistic costs,
-mandatory baselines, and overfitting-adjusted metrics (DSR, PBO).
+shared-capital target-weight accounting, optional legacy baselines, and
+overfitting-adjusted metrics (DSR, PBO).
 
 It also includes a separate statistical-arbitrage path for market-neutral pair
 research: train-only cointegration discovery, residual stationarity and
@@ -50,24 +51,35 @@ Both `scripts/training.py` and `scripts/backtest.py` iterate the **same** fold
 structure: training writes `split_idx.npz` per fold; the backtest replays the
 identical test-date ranges. There is no 80/20 split anywhere.
 
-### Execution model: signal on close, fill at next open
-`src/execution/execution_model.py`. A signal computed on bar *t*'s close is
-filled at bar *t+1* (market-on-open by default, `--order_type MOC` for
-market-on-close). Nothing fills same-bar. Costs applied per fill:
+### Execution model: target on close, fill at next open
+The default `scripts/backtest.py` path uses
+`src/execution/target_weights.py`: each model emits a continuous target weight
+at bar *t*'s close, the target fills at the next bar's open, and PnL accrues
+only after that fill. Fold-last targets are dropped so a pending order cannot
+leak across folds; already-filled weights continue into the next fold. Small
+same-side changes can be suppressed with `--rebalance_band_weight`, and rows are
+scaled to `--max_gross_exposure`.
+
+The legacy order path remains available with `--legacy_orders`. It uses
+`src/execution/execution_model.py`: a signal computed on bar *t*'s close is
+translated to LONG/SHORT/FLAT orders and filled at bar *t+1* (market-on-open by
+default, `--order_type MOC` for market-on-close). Nothing fills same-bar.
+
+Costs applied in both paths:
 
 - half-spread (`--spread_bps`) + linear notional impact (`--slippage_coeff`),
 - commission in bps (`--commission_bps`),
 - daily **borrow** on open short notional (`--borrow_bps_annual`) — shorts are
   not free.
 
-Reported PnL is **net** of all of the above on a fold-aligned, concatenated
-equity curve.
+Reported PnL is **net** of all of the above on a fold-aligned equity curve.
 
-### Baselines are mandatory
+### Baselines and legacy comparisons
 `src/baselines/`: Buy-and-Hold, MA-crossover (`--ma_fast`/`--ma_slow`), and
-time-series momentum (`--tsmom_lookback`). They traverse the *same* fold
-structure with the same costs, so the comparison is fair and the cross-strategy
-PBO is well-defined. Run with `--no_baselines` to skip (not recommended).
+time-series momentum (`--tsmom_lookback`). In `--legacy_orders` mode they
+traverse the *same* fold structure with the same costs, so the comparison is
+fair and the cross-strategy PBO is well-defined. The default target-weight mode
+emits one shared portfolio packet rather than per-symbol baseline tables.
 
 ### Overfitting-adjusted metrics
 `src/validation/metrics.py`:
@@ -79,8 +91,19 @@ PBO is well-defined. Run with `--no_baselines` to skip (not recommended).
   IS-best strategy underperforms OOS. High PBO ⇒ the selection is overfit.
 - **DSR** (Deflated Sharpe Ratio) — PSR with the benchmark set to the *expected
   maximum* Sharpe under the False Strategy Theorem given the number of trials.
-  Computed by `scripts/sweep.py` over a real hyperparameter grid; the backtest
-  shows it when you pass `--trial_sharpes_json`.
+  Computed by `scripts/sweep.py` over a real hyperparameter grid; the default
+  target-weight backtest records it in the root claim packet when you pass
+  `--trial_sharpes_json`.
+
+### Research claim packets
+`src/validation/trials.py` defines the canonical research-trial packet used to
+turn script outputs into a publishable claim surface. A packet records the
+strategy, config hash, code commit, data convention, artifact manifest,
+gross/net/cost metrics, trial count/DSR when available, and a claim tier:
+`mechanics_clean`, `gross_edge`, `net_edge`, or `robust_edge`.
+`scripts/backtest.py`, `scripts/sweep.py`, `scripts/rl_seed_eval.py`, and the
+stat-arb CLIs write `claim_packet.json`; new strategy surfaces should do the
+same before any result is described as more than a mechanics smoke.
 
 ### Conformal prediction bands (EnbPI + ACI)
 `src/conformal/`. The ensemble emits a position band, not just a point. EnbPI
@@ -100,9 +123,21 @@ and `src/features.py` plus `tests/test_sentiment_leakage.py` /
 
 ---
 
-## How to read the backtest report
+## How to read the backtest output
 
-`scripts/backtest.py` prints a per-strategy comparison block:
+By default, `scripts/backtest.py` writes one shared-capital portfolio under
+`results/wfo_backtest_*`:
+
+- `target_weights.csv` — close-time portfolio targets.
+- `fill_weights.csv` — weights actually filled at next opens.
+- `costs.csv` — turnover, gross/net exposure, borrow, execution costs, and
+  dividend return contribution.
+- `equity_curve.csv` — portfolio value and net returns.
+- `claim_packet.json` — canonical result packet with config/data/artifact
+  identity and claim tier.
+
+With `--legacy_orders`, the script preserves the older per-symbol report and
+prints a per-strategy comparison block:
 
 ```
 Strategy        TotRet    AnnRet   Sharpe  PSR(>0)    MaxDD   Calmar
@@ -115,7 +150,7 @@ Strategy        TotRet    AnnRet   Sharpe  PSR(>0)    MaxDD   Calmar
 - **MaxDD** — maximum drawdown (positive-magnitude convention).
 - **Calmar** — annualized return / max drawdown; `n/a` when undefined.
 
-Footers (one per backtest, not per strategy):
+Legacy footers (one per backtest, not per strategy):
 
 - **PBO** — across all strategies in the table. The single most important line:
   a strong ensemble Sharpe with PBO near or above 0.5 means the result is
@@ -125,7 +160,8 @@ Footers (one per backtest, not per strategy):
   raw Sharpe, when a grid was searched.**
 
 Per-strategy returns are inner-joined by date before PBO so the matrix is
-fold-aligned.
+fold-aligned. In default target-weight mode, read the root `claim_packet.json`
+and `metrics.json` first.
 
 ---
 
@@ -170,6 +206,9 @@ python -m scripts.backtest --training_run runs/{run_name}
 # With a sweep's trial Sharpes so the report shows DSR:
 python -m scripts.backtest --training_run runs/{run_name} \
     --trial_sharpes_json results/{sweep}/trial_sharpes.json
+
+# Preserve the old per-symbol order/backtest table path:
+python -m scripts.backtest --training_run runs/{run_name} --legacy_orders
 ```
 
 ### 3. Hyperparameter sweep → honest DSR (forecast-only)
@@ -235,12 +274,13 @@ target (the file backend is deprecated).
 
 **Corporate actions.** Prices are fetched `adjust=splits` — split-adjusted but
 **not** dividend-adjusted, so the close is a faithful tradeable price.
-Dividends are credited as **explicit cash** in the backtest
-(`DataLoader.fetch_dividends` → `TradingStrategy.apply_dividends`): a long held
-over an ex-date takes a mark-to-market markdown that the per-share credit
-offsets (a short is debited), making the position total-return correct without
-back-adjusting prices. Trade-off: ex-dividend gaps remain in the
-return/volatility *features*. `--no_dividends` disables the credit.
+Dividends are credited explicitly in the backtest (`DataLoader.fetch_dividends`
+→ `target_weights.py` dividend-return contribution, or
+`TradingStrategy.apply_dividends` in legacy order mode): a long held over an
+ex-date takes a mark-to-market markdown that the dividend credit offsets (a
+short is debited), making the position total-return correct without
+back-adjusting prices. Trade-off: ex-dividend gaps remain in the return/volatility
+*features*. `--no_dividends` disables the credit.
 
 **Cache integrity.** Cached bars are keyed by requested range
 (`{symbol}_{interval}_{start}_{end}.parquet`) and reused only when the cached
@@ -267,7 +307,6 @@ mind.
 - Sentiment distillation. The pipeline ships keyword `SentimentAnalyzer` and an
   interim FinBERT `TransformerSentimentAnalyzer`; the white-box distillation
   plan is documented in `docs/sentiment_roadmap.md` but not implemented.
-- Cross-symbol shared-cash portfolio (each symbol is backtested independently).
 - A market simulator for multi-step synthetic OHLCV; positions are held flat
   across the prediction horizon rather than iteratively re-forecast.
 
@@ -281,26 +320,27 @@ src/
   data_loader.py       Twelvedata bars + dividends, range-keyed cache
   features.py          technical indicators, train-only clip bounds
   sentiment_analysis.py keyword + FinBERT analyzers, PIT bucketing
-  trading.py           signals, position accounting, backtest loop
+  trading.py           target generation, signals, legacy position accounting
   logging_utils.py     configure_logging + per-symbol adapter (Phase 5.1)
   models/              arima, prophet, lstm, xgboost, {lstm,xlstm}_ppo, xlstm_grpo,
                        ensemble, registry (forecast vs policy), mapping (vol-sizing)
   baselines/           buy-and-hold, MA-crossover, TSMOM
-  execution/           ExecutionModel + cost functions
-  validation/          PurgedWalkForward, metrics (PSR/PBO/DSR/Calmar)
+  execution/           target-weight accounting, ExecutionModel + cost functions
+  validation/          PurgedWalkForward, metrics (PSR/PBO/DSR/Calmar),
+                       research claim packets
   conformal/           EnbPI + ACI
   arbitrage/           cointegration pair scan, causal spread signals,
                        capped portfolio accounting
   tracking/            MLflow wrappers
 scripts/
   training.py          per-symbol purged-WFO training → runs/{run_name}/
-  backtest.py          WFO backtest vs per-fold models + baselines + PBO/DSR
+  backtest.py          target-weight WFO, legacy order WFO + baselines/PBO
   sweep.py             ensemble-layer grid → DSR
   rl_seed_eval.py      multi-seed RL overfitting study
   stat_arb.py          train-only pairs stat-arb backtest
   stat_arb_wfo.py      rolling formation/test pairs stat-arb WFO
   prediction.py        point predictions from a saved model
-tests/                 ~223 tests (validation, leakage, execution, conformal, logging)
+tests/                 ~234 offline tests (validation, leakage, execution, conformal, logging)
 ```
 
 ## Configuration

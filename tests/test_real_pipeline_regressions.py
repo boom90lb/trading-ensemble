@@ -19,6 +19,7 @@ depend on a JAX/GPU policy member; Prophet is exercised in its own test.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -247,6 +248,63 @@ def test_evaluate_tolerates_some_nan_predictions(monkeypatch):
     assert metrics, "evaluate() returned {} despite finite rows being available"
     assert "position_mae" in metrics and np.isfinite(metrics["position_mae"])
     assert metrics.get("position_n_finite", 0) >= 2
+
+
+def test_train_serve_prediction_parity_from_fold_feature_state(tmp_path: Path):
+    from scripts.backtest import _fold_model_data
+    from scripts.training import build_fold_metadata
+
+    horizon = 5
+    usable, target_col, fe = _build_enhanced(n=260, horizon=horizon)
+    split = 180
+    train_raw, test_raw = usable.iloc[:split], usable.iloc[split:220]
+    fe.fit_scalers(train_raw, "SYM")
+    train_scaled = fe.transform_features(train_raw, "SYM", is_train=True)
+    test_scaled = fe.transform_features(test_raw, "SYM", is_train=False)
+
+    drop = [c for c in train_scaled.columns if "target_" in c or "direction_" in c]
+    X_train = train_scaled.drop(columns=drop)
+    y_train = train_scaled[target_col]
+    X_test = test_scaled.drop(columns=drop).reindex(columns=X_train.columns)
+
+    ensemble = EnsembleModel(
+        target_column="close",
+        horizon=horizon,
+        config=EnsembleConfig(
+            models=[ModelConfig(name="xgboost", enabled=True, weight=1.0)],
+            weighting_strategy="static",
+        ),
+    )
+    ensemble.fit(X_train, y_train)
+
+    fold_dir = tmp_path / "fold_0"
+    fold_dir.mkdir()
+    feature_columns = X_train.columns.tolist()
+    fe.save_state(
+        fold_dir / "feature_engineer_state.pkl",
+        symbol="SYM",
+        feature_columns=feature_columns,
+    )
+    with open(fold_dir / "fold_metadata.json", "w") as f:
+        json.dump(
+            build_fold_metadata(
+                symbol="SYM",
+                horizon=horizon,
+                target_col=target_col,
+                train_raw=train_raw,
+                test_raw=test_raw,
+                model_feature_columns=feature_columns,
+            ),
+            f,
+            indent=2,
+        )
+
+    replay_X = _fold_model_data(fold_dir, symbol="SYM", full_df=usable).loc[X_test.index]
+    pd.testing.assert_frame_equal(replay_X, X_test)
+    pd.testing.assert_frame_equal(
+        ensemble.get_model_contributions(replay_X),
+        ensemble.get_model_contributions(X_test),
+    )
 
 
 # --------------------------------------------------------------------------

@@ -20,6 +20,7 @@ embargo_pct, …) so a downstream backtest can replay the same fold structure.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import warnings
@@ -66,6 +67,92 @@ except AttributeError:
 # per-run log file are honored; this module-level logger is the fallback name.
 logger = logging.getLogger(__name__)
 
+R0_QUARANTINED_MODELS = frozenset({"lstm"})
+DEFAULT_MODEL_SELECTION = "arima,prophet,xgboost,lstm_ppo,xlstm_ppo,xlstm_grpo"
+FOLD_METADATA_SCHEMA_VERSION = 2
+
+
+def parse_model_names(raw: str) -> List[str]:
+    """Parse and validate a comma-separated production model list."""
+    model_names = [n.strip() for n in raw.split(",") if n.strip()]
+    quarantined = sorted(set(model_names) & R0_QUARANTINED_MODELS)
+    if quarantined:
+        raise ValueError(
+            "R0 quarantine: forecast LSTM is disabled until the R1 rebuild "
+            f"removes label-in-window leakage and inference zero-fill. Got: {quarantined}"
+        )
+    return model_names
+
+
+def reject_sentiment_flag(enabled: bool, *, surface: str) -> None:
+    """Fail loud on production sentiment paths quarantined by R0."""
+    if enabled:
+        raise ValueError(
+            f"R0 quarantine: sentiment is disabled for {surface} until the "
+            "paginated point-in-time FinBERT path replaces the legacy keyword scorer."
+        )
+
+
+def index_sha256(index: pd.Index) -> str:
+    """Stable SHA-256 over a DatetimeIndex's exact replay order."""
+    dt_index = pd.DatetimeIndex(index)
+    if dt_index.tz is not None:
+        normalized = dt_index.tz_convert("UTC")
+    else:
+        normalized = dt_index
+    values = np.asarray(normalized.asi8, dtype="<i8")
+    h = hashlib.sha256()
+    h.update(str(dt_index.tz).encode("utf-8"))
+    h.update(len(values).to_bytes(8, byteorder="little", signed=False))
+    h.update(values.tobytes())
+    return h.hexdigest()
+
+
+def index_utc_ns(index: pd.Index) -> List[int]:
+    """Exact DatetimeIndex membership as UTC nanoseconds, preserving order."""
+    dt_index = pd.DatetimeIndex(index)
+    if dt_index.tz is not None:
+        normalized = dt_index.tz_convert("UTC")
+    else:
+        normalized = dt_index
+    return [int(v) for v in np.asarray(normalized.asi8, dtype="<i8")]
+
+
+def index_date_span(index: pd.Index) -> Optional[Dict[str, str]]:
+    """Inclusive start/end span for fold metadata."""
+    if len(index) == 0:
+        return None
+    dt_index = pd.DatetimeIndex(index)
+    return {
+        "start": pd.Timestamp(dt_index[0]).isoformat(),
+        "end": pd.Timestamp(dt_index[-1]).isoformat(),
+    }
+
+
+def build_fold_metadata(
+    *,
+    symbol: str,
+    horizon: int,
+    target_col: str,
+    train_raw: pd.DataFrame,
+    test_raw: pd.DataFrame,
+    model_feature_columns: List[str],
+) -> Dict[str, Any]:
+    """Create the replay contract persisted beside a fold model."""
+    return {
+        "schema_version": FOLD_METADATA_SCHEMA_VERSION,
+        "symbol": symbol,
+        "horizon": int(horizon),
+        "target_column": target_col,
+        "train_date_span": index_date_span(train_raw.index),
+        "test_date_span": index_date_span(test_raw.index),
+        "train_index_utc_ns": index_utc_ns(train_raw.index),
+        "test_index_utc_ns": index_utc_ns(test_raw.index),
+        "train_index_sha256": index_sha256(train_raw.index),
+        "test_index_sha256": index_sha256(test_raw.index),
+        "model_feature_columns": list(model_feature_columns),
+    }
+
 
 def parse_args():
     """Parse command line arguments."""
@@ -104,7 +191,7 @@ def parse_args():
                         help="Use sentiment analysis features")
     parser.add_argument(
         "--models", type=str,
-        default="arima,prophet,lstm,xgboost,lstm_ppo,xlstm_ppo,xlstm_grpo",
+        default=DEFAULT_MODEL_SELECTION,
         help="Comma-separated list of ensemble member names",
     )
     parser.add_argument("--optimize", action="store_true",
@@ -411,6 +498,7 @@ def train_symbol_wfo(
         y_test = test_scaled[target_col]
         # Defensive: re-align if scalers dropped any columns on test.
         X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+        model_feature_columns = X_train.columns.tolist()
 
         ensemble = EnsembleModel(
             target_column="close",
@@ -453,6 +541,24 @@ def train_symbol_wfo(
         )
 
         ensemble.save(directory=fold_dir / "ensemble_model")
+        feature_engineer.save_state(
+            fold_dir / "feature_engineer_state.pkl",
+            symbol=symbol,
+            feature_columns=model_feature_columns,
+        )
+        with open(fold_dir / "fold_metadata.json", "w") as f:
+            json.dump(
+                build_fold_metadata(
+                    symbol=symbol,
+                    horizon=training_config.prediction_horizon,
+                    target_col=target_col,
+                    train_raw=train_raw,
+                    test_raw=test_raw,
+                    model_feature_columns=model_feature_columns,
+                ),
+                f,
+                indent=2,
+            )
         # Persist the fold's split indices so the backtest WFO loop can
         # iterate the same fold structure deterministically.
         np.savez(
@@ -525,6 +631,8 @@ def filter_universe_asof(
 def main():
     """Main function."""
     args = parse_args()
+    reject_sentiment_flag(args.use_sentiment, surface="training")
+    model_names = parse_model_names(args.models)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     configure_logging(verbose=args.verbose, run_name="training")
 
@@ -574,9 +682,7 @@ def main():
         return
 
     feature_engineer = FeatureEngineer()
-    sentiment_analyzer = (
-        SentimentAnalyzer() if args.use_sentiment else None
-    )
+    sentiment_analyzer = None
 
     enhanced_data: Dict[str, pd.DataFrame] = {}
     for symbol, raw_df in all_data.items():
@@ -589,7 +695,6 @@ def main():
             horizon=training_config.prediction_horizon,
         )
 
-    model_names = [n.strip() for n in args.models.split(",") if n.strip()]
     model_configs = [
         ModelConfig(
             name=name,

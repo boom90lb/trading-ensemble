@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List
 
@@ -20,6 +21,12 @@ from src.arbitrage import (
 from src.config import ExecutionConfig, RESULTS_DIR
 from src.data_loader import DataLoader
 from src.logging_utils import configure_logging, get_symbol_logger
+from src.validation.trials import (
+    current_git_commit,
+    emit_research_claim_packet,
+    summary_claim_fields,
+    validate_claim_packet_dir,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,16 +125,60 @@ def main() -> None:
         Path(args.output_dir) if args.output_dir else RESULTS_DIR / f"stat_arb_{pd.Timestamp.utcnow():%Y%m%d_%H%M%S}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts = {
+        "pairs": "pairs.json",
+        "returns": "returns.csv",
+        "equity": "equity.csv",
+        "target_weights": "target_weights.csv",
+        "costs": "costs.csv",
+        "summary": "summary.json",
+        "claim_packet": "claim_packet.json",
+    }
     pairs_payload = [c.__dict__ for c in candidates]
-    (out_dir / "pairs.json").write_text(json.dumps(pairs_payload, indent=2))
-    result.returns.to_csv(out_dir / "returns.csv")
-    result.equity.to_csv(out_dir / "equity.csv")
-    result.target_weights.to_csv(out_dir / "target_weights.csv")
-    result.costs.to_csv(out_dir / "costs.csv")
-    (out_dir / "summary.json").write_text(json.dumps(result.metrics, indent=2, allow_nan=True))
+    (out_dir / artifacts["pairs"]).write_text(json.dumps(pairs_payload, indent=2))
+    result.returns.to_csv(out_dir / artifacts["returns"])
+    result.equity.to_csv(out_dir / artifacts["equity"])
+    result.target_weights.to_csv(out_dir / artifacts["target_weights"])
+    result.costs.to_csv(out_dir / artifacts["costs"])
+
+    config_payload = {
+        "selection": asdict(selection_cfg),
+        "signal": asdict(signal_cfg),
+        "execution": asdict(execution),
+        "formation_bars": args.formation_bars,
+        "max_gross": args.max_gross,
+        "max_symbol_abs_weight": args.max_symbol_abs_weight,
+    }
+    data_payload = {
+        "symbols": symbols,
+        "start_date": args.start_date,
+        "end_date": args.end_date,
+        "source": "Twelvedata",
+        "bar_interval": "1d",
+        "data_convention": "split_adjusted_open_close_price_return_no_dividends",
+        "universe_policy": "explicit_symbol_list",
+    }
+    packet = emit_research_claim_packet(
+        out_dir,
+        filename=artifacts["claim_packet"],
+        strategy="pairs_stat_arb",
+        config=config_payload,
+        data=data_payload,
+        returns=result.returns,
+        costs=result.costs,
+        target_weights=result.target_weights,
+        summary=result.metrics,
+        artifacts=artifacts,
+        code_commit=current_git_commit(RESULTS_DIR.parent),
+    )
+
+    summary_payload = {**result.metrics, **summary_claim_fields(packet, packet_filename=artifacts["claim_packet"])}
+    (out_dir / artifacts["summary"]).write_text(json.dumps(summary_payload, indent=2, allow_nan=True))
+    validate_claim_packet_dir(out_dir)
     print(
         json.dumps(
-            {"output_dir": str(out_dir), "n_pairs": len(candidates), **result.metrics},
+            {"output_dir": str(out_dir), "n_pairs": len(candidates), **summary_payload},
             indent=2,
             allow_nan=True,
         )

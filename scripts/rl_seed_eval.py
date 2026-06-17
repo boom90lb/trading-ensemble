@@ -58,6 +58,12 @@ from src.validation.metrics import (
     periodic_sharpe,
     probabilistic_sharpe_ratio,
 )
+from src.validation.trials import (
+    current_git_commit,
+    emit_research_claim_packet,
+    summary_claim_fields,
+    validate_claim_packet_dir,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -368,6 +374,7 @@ def main():
 
     init_mlflow(args.experiment)
     per_member_summary: Dict[str, Any] = {}
+    member_seed_returns: Dict[str, Dict[int, pd.Series]] = {}
 
     with mlflow.start_run(run_name=f"rl_seed_eval_{training_run_dir.name}"):
         log_params_safe({
@@ -401,6 +408,7 @@ def main():
 
                 summary = summarize_member(member, seed_returns)
                 per_member_summary[member] = summary
+                member_seed_returns[member] = seed_returns
                 # Aggregated mean±std is the PRIMARY metric of record.
                 log_metrics_safe({
                     f"{member}_seed_sharpe_mean": summary["mean"],
@@ -411,6 +419,68 @@ def main():
 
     out_dir = Path(args.output_dir) if args.output_dir else training_run_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-member canonical research-claim packet. RL member robustness is a
+    # claim about seed stability, not a single P&L curve, so each member is
+    # represented by a real single-seed return series (the seed whose Sharpe is
+    # closest to the seed-mean -- never a variance-suppressed seed average) and
+    # the cross-seed DSR over n_seeds trials rides along in the metrics.
+    for member, summary in list(per_member_summary.items()):
+        mean = summary.get("mean")
+        seed_sharpe = summary.get("seed_sharpe") or {}
+        finite_seed_sharpe = {
+            s: v for s, v in seed_sharpe.items() if v is not None and np.isfinite(v)
+        }
+        if mean is None or not finite_seed_sharpe:
+            continue  # no valid seed -> nothing to claim
+        rep_seed = min(finite_seed_sharpe, key=lambda s: abs(finite_seed_sharpe[s] - mean))
+        rep_returns = member_seed_returns[member][int(rep_seed)]
+        member_dir = out_dir / member
+        member_dir.mkdir(parents=True, exist_ok=True)
+        rep_returns.to_csv(member_dir / "representative_returns.csv")
+        packet = emit_research_claim_packet(
+            member_dir,
+            strategy="rl_member_seed_robustness",
+            config={
+                "member": member,
+                "representative_seed": int(rep_seed),
+                "seeds": seeds,
+                "seed_sharpe_mean": mean,
+                "seed_sharpe_std": summary.get("std"),
+                "n_seeds": summary.get("n_seeds"),
+                "n_valid_seeds": summary.get("n_valid"),
+                "rl_timesteps": args.rl_timesteps,
+                "horizon": horizon,
+                "representation": (
+                    "single representative seed closest to the seed-mean Sharpe; "
+                    "cross-seed robustness is carried in metrics.dsr over n_seeds trials"
+                ),
+            },
+            data={
+                "symbols": list(symbol_to_frames),
+                "timeframe": training_config["timeframe"],
+                "start_date": training_config["start_date"],
+                "end_date": training_config.get("end_date"),
+                "source": "Twelvedata",
+                "data_convention": (
+                    "split_adjusted_price_return_no_dividends"
+                    if args.no_dividends
+                    else "split_adjusted_price_return_dividends_as_cash"
+                ),
+                "training_run": str(training_run_dir),
+                "universe_policy": "training_run_symbol_list",
+            },
+            returns=rep_returns,
+            summary={"dsr": summary.get("dsr"), "n_trials": summary.get("n_seeds")},
+            artifacts={
+                "representative_returns": "representative_returns.csv",
+                "claim_packet": "claim_packet.json",
+            },
+            code_commit=current_git_commit(Path(__file__).resolve().parents[1]),
+        )
+        per_member_summary[member] = {**summary, **summary_claim_fields(packet)}
+        validate_claim_packet_dir(member_dir)
+
     out_path = out_dir / "rl_seed_eval.json"
     with open(out_path, "w") as f:
         json.dump({

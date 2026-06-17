@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.features import FeatureEngineer
 
@@ -111,3 +112,39 @@ def test_columns_not_seen_at_fit_pass_through():
     out = fe.transform_features(test_df, "AAPL", is_train=False)
     # The new column must pass through unchanged (no stored bound, no recompute).
     np.testing.assert_array_equal(out["never_fit_col"].to_numpy(), test_df["never_fit_col"].to_numpy())
+
+
+def test_feature_engineer_state_round_trips(tmp_path):
+    fe = FeatureEngineer()
+    train = fe.create_features(_ohlcv(seed=0))
+    test_df = fe.create_features(_ohlcv(seed=1))
+    fe.fit_scalers(train, "AAPL")
+
+    expected = fe.transform_features(test_df, "AAPL", is_train=False)
+    state_path = tmp_path / "feature_engineer_state.pkl"
+    fe.save_state(state_path, symbol="AAPL", feature_columns=expected.columns.tolist())
+
+    loaded = FeatureEngineer.load_state(state_path)
+    actual = loaded.transform_features(test_df, "AAPL", is_train=False)
+    pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_feature_transform_raises_on_fitted_column_drift():
+    fe = FeatureEngineer()
+    train = fe.create_features(_ohlcv(seed=0))
+    fe.fit_scalers(train, "AAPL")
+
+    drifted = fe.create_features(_ohlcv(seed=1)).drop(columns=["close"])
+    with pytest.raises(ValueError, match="price feature columns missing"):
+        fe.transform_features(drifted, "AAPL", is_train=False)
+
+
+def test_feature_transform_raises_on_scaler_shape_drift():
+    fe = FeatureEngineer()
+    train = fe.create_features(_ohlcv(seed=0))
+    test_df = fe.create_features(_ohlcv(seed=1))
+    fe.fit_scalers(train, "AAPL")
+
+    fe.price_scalers["AAPL"].min_vals.value = fe.price_scalers["AAPL"].min_vals.value[:-1]
+    with pytest.raises(ValueError, match="price scaler shape mismatch"):
+        fe.transform_features(test_df, "AAPL", is_train=False)

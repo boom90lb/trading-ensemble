@@ -9,8 +9,7 @@ Per the Phase 2.7 scope (confirmed with the user):
 
   * **Search space:** ensemble-layer knobs only — ``target_vol``,
     ``signal_threshold``, ``weighting_strategy``. Members are forecast-only
-    (default ``xgboost,lstm``) so no RL agent is refit per trial (that would
-    be infeasible at grid scale).
+    by default (``xgboost``) so no RL agent is refit per trial.
   * **Trials → DSR:** each trial's *net, cost-aware* daily WFO-OOS Sharpe is
     BOTH the selection criterion and ``sr_obs``. DSR deflates the selection
     over N — no separate holdout is burned (standard Bailey/LdP usage). All
@@ -47,7 +46,12 @@ import numpy as np
 import pandas as pd
 
 from scripts.backtest import load_fold_ensemble, run_symbol_wfo
-from scripts.training import build_features, train_symbol_wfo
+from scripts.training import (
+    build_features,
+    parse_model_names,
+    reject_sentiment_flag,
+    train_symbol_wfo,
+)
 from src.config import (
     DEFAULT_MODEL_WEIGHTS,
     DEFAULT_TRAINING_CONFIG,
@@ -56,7 +60,6 @@ from src.config import (
 )
 from src.data_loader import DataLoader
 from src.features import FeatureEngineer
-from src.sentiment_analysis import SentimentAnalyzer
 from src.tracking.mlflow_utils import (
     init_mlflow,
     log_artifact_dir,
@@ -68,6 +71,12 @@ from src.validation.metrics import (
     expected_max_sharpe,
     periodic_sharpe,
     probabilistic_sharpe_ratio,
+)
+from src.validation.trials import (
+    current_git_commit,
+    emit_research_claim_packet,
+    summary_claim_fields,
+    validate_claim_packet_dir,
 )
 from src.validation.walk_forward import PurgedWalkForward
 
@@ -304,7 +313,7 @@ def run_sweep(
     horizon = args.horizon
     target_col = f"target_{horizon}"
 
-    model_names = [n.strip() for n in args.models.split(",") if n.strip()]
+    model_names = parse_model_names(args.models)
     model_configs = [
         ModelConfig(name=n, enabled=True, weight=DEFAULT_MODEL_WEIGHTS.get(n, 1.0))
         for n in model_names
@@ -383,6 +392,45 @@ def run_sweep(
             }.items() if v is not None
         })
 
+        # Canonical research-claim packet for the SELECTED config. The trial set
+        # for deflation is the valid trials, so trial_count == n_valid and the
+        # packet DSR matches summarize_sweep's selection-bias correction.
+        selected_id = summary.get("selected_trial_id")
+        if selected_id is not None:
+            best = next(t for t in trial_results if t.trial_id == selected_id)
+            packet = emit_research_claim_packet(
+                output_dir,
+                strategy="ensemble_hparam_sweep",
+                config={
+                    "selected_config": summary["selected_config"],
+                    "grid": grid,
+                    "models": model_names,
+                    "horizon": horizon,
+                    "n_splits": training_config.n_splits,
+                    "embargo_pct": training_config.embargo_pct,
+                    "expanding": training_config.expanding,
+                },
+                data={
+                    "symbols": list(enhanced_data.keys()),
+                    "timeframe": args.timeframe,
+                    "start_date": args.start_date,
+                    "end_date": args.end_date,
+                    "source": "Twelvedata",
+                    "data_convention": "split_adjusted_price_return_no_dividends",
+                    "universe_policy": "explicit_symbol_list",
+                },
+                returns=best.combined_returns,
+                summary={"dsr": summary.get("dsr"), "n_trials": summary.get("n_valid")},
+                artifacts={
+                    "sweep_results": "sweep_results.json",
+                    "trial_sharpes": "trial_sharpes.json",
+                    "selected_config": "selected_config.json",
+                    "claim_packet": "claim_packet.json",
+                },
+                code_commit=current_git_commit(Path(__file__).resolve().parents[1]),
+            )
+            summary.update(summary_claim_fields(packet))
+
         # Persist artifacts.
         with open(output_dir / "sweep_results.json", "w") as f:
             json.dump(summary, f, indent=2, default=str)
@@ -391,6 +439,8 @@ def run_sweep(
         if summary.get("selected_config") is not None:
             with open(output_dir / "selected_config.json", "w") as f:
                 json.dump(summary["selected_config"], f, indent=2, default=str)
+        if summary.get("claim_packet"):
+            validate_claim_packet_dir(output_dir)
         log_artifact_dir(output_dir)
 
     _print_summary(summary)
@@ -434,7 +484,7 @@ def prepare_sweep_data(args) -> Dict[str, pd.DataFrame]:
     data_loader = DataLoader()
     all_data = data_loader.fetch_training_data(training_config)
     feature_engineer = FeatureEngineer()
-    sentiment_analyzer = SentimentAnalyzer() if args.use_sentiment else None
+    sentiment_analyzer = None
 
     enhanced: Dict[str, pd.DataFrame] = {}
     for symbol, raw_df in all_data.items():
@@ -459,7 +509,7 @@ def parse_args():
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--use_sentiment", action="store_true")
     p.add_argument(
-        "--models", type=str, default="xgboost,lstm",
+        "--models", type=str, default="xgboost",
         help="Forecast-only members. RL members make the grid infeasible.",
     )
     p.add_argument("--rl_timesteps", type=int, default=0)
@@ -493,6 +543,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    reject_sentiment_flag(args.use_sentiment, surface="sweep")
+    parse_model_names(args.models)
     grid = DEFAULT_GRID
     if args.grid_json:
         with open(args.grid_json) as f:

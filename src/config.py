@@ -188,6 +188,16 @@ class TradingConfig:
     # Minimum |position_target| to emit a LONG/SHORT signal (else FLAT).
     # Exposed as config (Phase 2.7) so a sweep can vary the trade threshold.
     signal_threshold: float = 0.1
+    # Library default remains the original ternary order path; scripts/backtest.py
+    # opts into target weights by default at the CLI layer.
+    execution_style: str = "legacy_orders"
+    # Absolute weight band around the currently filled target. In target-weight
+    # mode, desired changes inside this band are suppressed rather than traded.
+    rebalance_band_weight: float = 0.0
+    # Multiplier on target-weight rebalance costs for stress tests.
+    rebalance_cost_multiplier: float = 1.0
+    # Portfolio gross cap for continuous target weights.
+    max_gross_exposure: float = 1.0
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
     def __post_init__(self):
@@ -201,6 +211,20 @@ class TradingConfig:
         assert 0 <= self.signal_threshold < 1, (
             f"signal_threshold must be in [0, 1); got {self.signal_threshold}"
         )
+        assert self.execution_style in ("legacy_orders", "target_weights"), (
+            "execution_style must be 'legacy_orders' or 'target_weights'; "
+            f"got {self.execution_style}"
+        )
+        assert self.rebalance_band_weight >= 0, (
+            f"rebalance_band_weight must be >= 0; got {self.rebalance_band_weight}"
+        )
+        assert self.rebalance_cost_multiplier >= 0, (
+            "rebalance_cost_multiplier must be >= 0; "
+            f"got {self.rebalance_cost_multiplier}"
+        )
+        assert self.max_gross_exposure > 0, (
+            f"max_gross_exposure must be > 0; got {self.max_gross_exposure}"
+        )
 
 
 # Single source of truth for ensemble member weights. Scripts must read from
@@ -208,7 +232,6 @@ class TradingConfig:
 DEFAULT_MODEL_WEIGHTS = {
     "arima": 1.0,
     "prophet": 1.0,
-    "lstm": 1.0,
     "xgboost": 1.0,
     "lstm_ppo": 1.0,
     "xlstm_ppo": 1.0,

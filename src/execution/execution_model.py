@@ -105,14 +105,14 @@ class ExecutionModel:
             portfolio_value: current portfolio value, used to scale linear impact.
 
         Returns:
-            Fills for every order whose submit_bar == bar_idx - 1.
-            Orders missing OHLC for their symbol on this bar remain queued.
+            Fills for every order submitted before ``bar_idx`` with OHLC on
+            this bar. Orders missing OHLC for their symbol remain queued.
         """
         fills: List[Fill] = []
         still_pending: List[Order] = []
 
         for order in self._pending:
-            if order.submit_bar != bar_idx - 1:
+            if order.submit_bar >= bar_idx:
                 still_pending.append(order)
                 continue
 

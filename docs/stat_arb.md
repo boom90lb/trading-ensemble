@@ -47,7 +47,11 @@ Walk-forward outputs go to `results/stat_arb_wfo_<ts>/`:
 - `pair_trial_sharpes.csv` - selected pair-book Sharpes used for the
   `pair_set_dsr` overfit diagnostic.
 - `summary.json` - return, Sharpe, PSR, drawdown, exposure, turnover, cost,
-  search-trial counts, pair turnover, and `pair_set_dsr`.
+  search-trial counts, pair turnover, `pair_set_dsr`, the config hash, and the
+  claim tier.
+- `claim_packet.json` - canonical research-trial packet with data convention,
+  config hash, code commit, artifact manifest, gross/net/cost metrics, DSR, and
+  the strongest supported claim tier.
 
 The single-split command writes the same core portfolio artifacts under
 `results/stat_arb_<ts>/`, but it is only a smoke test. Do not treat one
