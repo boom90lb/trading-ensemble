@@ -44,7 +44,7 @@ from scripts.backtest import (
     run_symbol_wfo,
 )
 from scripts.sweep import combine_symbol_returns
-from scripts.training import build_features, select_rl_features
+from scripts.training import build_features, reject_sentiment_flag, select_rl_features
 from src.config import EnsembleConfig, ModelConfig
 from src.data_loader import DataLoader
 from src.features import FeatureEngineer
@@ -331,6 +331,7 @@ def main():
     target_col = f"target_{horizon}"
     # Sentiment join mirrors the training run; keyword analyzer is the wired one.
     use_sentiment = bool(training_config.get("use_sentiment", False))
+    reject_sentiment_flag(use_sentiment, surface="rl_seed_eval")
     sentiment_analyzer = SentimentAnalyzer() if use_sentiment else None
 
     data_loader = DataLoader()

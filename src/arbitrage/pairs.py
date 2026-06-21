@@ -9,9 +9,9 @@ cointegration tests on the evaluation period.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -41,6 +41,7 @@ class PairSelectionConfig:
     min_abs_beta: float = 0.05
     max_pairs: int = 10
     autolag: str = "aic"
+    construction_mode: Literal["fdr_hard", "shrunk_candidates"] = "fdr_hard"
 
     def __post_init__(self) -> None:
         if self.min_obs < 30:
@@ -61,6 +62,11 @@ class PairSelectionConfig:
             raise ValueError(f"min_abs_beta must be >= 0, got {self.min_abs_beta}")
         if self.max_pairs < 1:
             raise ValueError(f"max_pairs must be >= 1, got {self.max_pairs}")
+        if self.construction_mode not in ("fdr_hard", "shrunk_candidates"):
+            raise ValueError(
+                "construction_mode must be 'fdr_hard' or 'shrunk_candidates', "
+                f"got {self.construction_mode!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -105,6 +111,7 @@ class PairCandidate:
     beta_drift: float
     return_corr: float
     n_obs: int
+    evidence_weight: float = 1.0
 
     @property
     def symbols(self) -> tuple[str, str]:
@@ -258,12 +265,26 @@ def _candidate_from_pair(
     )
 
 
-def _rejection_reason(candidate: PairCandidate, fdr_keep: bool, config: PairSelectionConfig) -> str | None:
-    if not fdr_keep:
+def _rejection_reason(
+    candidate: PairCandidate,
+    fdr_keep: bool,
+    config: PairSelectionConfig,
+    *,
+    gate_fdr: bool = True,
+    gate_adf: bool = True,
+) -> str | None:
+    """Return the first failing gate, or None if the candidate is admitted.
+
+    ``gate_fdr`` / ``gate_adf`` allow the BH-FDR significance gate and the
+    residual-ADF gate to be demoted to recorded diagnostics (the
+    ``shrunk_candidates`` construction mode) while the economic tradeability
+    filters still apply.
+    """
+    if gate_fdr and not fdr_keep:
         return "fdr"
     if candidate.coint_pvalue > config.max_coint_pvalue:
         return "coint_pvalue"
-    if candidate.adf_pvalue > config.max_adf_pvalue:
+    if gate_adf and candidate.adf_pvalue > config.max_adf_pvalue:
         return "adf_pvalue"
     if not np.isfinite(candidate.return_corr) or abs(candidate.return_corr) < config.min_abs_return_corr:
         return "return_corr"
@@ -272,6 +293,36 @@ def _rejection_reason(candidate: PairCandidate, fdr_keep: bool, config: PairSele
     if not np.isfinite(candidate.beta_drift) or candidate.beta_drift > config.max_beta_drift:
         return "beta_drift"
     return None
+
+
+def _evidence_weights(strengths: np.ndarray) -> np.ndarray:
+    """Positive-part James-Stein shrinkage of candidate strengths, scaled to max 1.
+
+    ``strengths`` are ``|coint_stat|`` magnitudes (Engle-Granger statistics) for
+    the admitted candidates, treated as approximately unit-variance test
+    statistics. The shrinkage intensity is data-determined (no free knob): noisy,
+    closely-spaced strengths are pulled hard toward the cross-sectional mean,
+    while a genuinely separated strong candidate keeps its weight. The shrunk
+    strengths are then scaled so the strongest pair has weight 1.0 and weaker
+    pairs get proportionally smaller (but non-zero) construction weights -- the
+    cross-sectional smoothing of weak signals in Da, Nagel & Xiu (2024).
+    """
+    s = np.asarray(strengths, dtype=float)
+    k = s.size
+    if k == 0:
+        return s
+    if k >= 3:
+        s_bar = float(s.mean())
+        ss = float(((s - s_bar) ** 2).sum())
+        c = max(0.0, 1.0 - (k - 2) / ss) if ss > _EPS else 0.0
+        shat = s_bar + c * (s - s_bar)
+    else:
+        shat = s.copy()
+    shat = np.clip(shat, 0.0, None)
+    top = float(shat.max())
+    if top <= _EPS:
+        return np.ones_like(s)
+    return shat / top
 
 
 def _known_rejection_counts(counter: Counter[str]) -> dict[str, int]:
@@ -327,16 +378,31 @@ def scan_cointegrated_pairs_with_report(
     fdr_mask = benjamini_hochberg_mask((c.coint_pvalue for c in raw), config.fdr_alpha)
     accepted_pvalues = [c.coint_pvalue for keep, c in zip(fdr_mask, raw) if keep]
     fdr_cutoff = float(max(accepted_pvalues)) if accepted_pvalues else None
-    filtered: list[PairCandidate] = []
-    for keep, candidate in zip(fdr_mask, raw):
-        reason = _rejection_reason(candidate, bool(keep), config)
-        if reason is None:
-            filtered.append(candidate)
-        else:
-            rejected[reason] += 1
-    filtered.sort(key=lambda c: (c.coint_pvalue, c.half_life, c.beta_drift))
-    selected = filtered[: config.max_pairs]
-    rejected["max_pairs"] += max(0, len(filtered) - len(selected))
+
+    if config.construction_mode == "fdr_hard":
+        filtered: list[PairCandidate] = []
+        for keep, candidate in zip(fdr_mask, raw):
+            reason = _rejection_reason(candidate, bool(keep), config)
+            if reason is None:
+                filtered.append(candidate)
+            else:
+                rejected[reason] += 1
+        filtered.sort(key=lambda c: (c.coint_pvalue, c.half_life, c.beta_drift))
+        selected = filtered[: config.max_pairs]
+        rejected["max_pairs"] += max(0, len(filtered) - len(selected))
+    else:  # shrunk_candidates: FDR + residual-ADF demoted to diagnostics
+        admitted: list[PairCandidate] = []
+        for keep, candidate in zip(fdr_mask, raw):
+            reason = _rejection_reason(candidate, bool(keep), config, gate_fdr=False, gate_adf=False)
+            if reason is None:
+                admitted.append(candidate)
+            else:
+                rejected[reason] += 1
+        admitted.sort(key=lambda c: (-abs(c.coint_stat), c.coint_pvalue, c.half_life))
+        capped = admitted[: config.max_pairs]
+        rejected["max_pairs"] += max(0, len(admitted) - len(capped))
+        weights = _evidence_weights(np.array([abs(c.coint_stat) for c in capped], dtype=float))
+        selected = [replace(c, evidence_weight=float(w)) for c, w in zip(capped, weights)]
     return PairSelectionReport(
         n_symbols=len(symbols),
         n_symbol_pairs=n_symbol_pairs,

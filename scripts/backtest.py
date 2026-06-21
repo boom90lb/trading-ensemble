@@ -89,6 +89,17 @@ RERUN_TRAINING_MSG = (
 )
 
 
+def _complete_training_fold(fold_dir: Path, horizon: int) -> bool:
+    """True when a fold has every artifact needed for deterministic replay."""
+    required_files = (
+        fold_dir / "fold_metadata.json",
+        fold_dir / "split_idx.npz",
+        fold_dir / "feature_engineer_state.pkl",
+        fold_dir / "ensemble_model" / f"ensemble_state_h{horizon}.pkl",
+    )
+    return all(path.is_file() for path in required_files)
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -196,6 +207,7 @@ def load_training_run(
         )
     with open(config_path) as f:
         training_config = json.load(f)
+    horizon = int(training_config["prediction_horizon"])
 
     fold_dirs_per_symbol: Dict[str, List[Path]] = {}
     for symbol_dir in sorted(training_run_dir.iterdir()):
@@ -204,8 +216,16 @@ def load_training_run(
         fold_dirs = sorted(
             d for d in symbol_dir.glob("fold_*") if d.is_dir()
         )
-        if fold_dirs:
-            fold_dirs_per_symbol[symbol_dir.name] = fold_dirs
+        complete_fold_dirs = [
+            d for d in fold_dirs if _complete_training_fold(d, horizon)
+        ]
+        if complete_fold_dirs:
+            fold_dirs_per_symbol[symbol_dir.name] = complete_fold_dirs
+        elif fold_dirs:
+            raise ValueError(
+                f"{symbol_dir.name} has {len(fold_dirs)} incomplete fold dirs "
+                "and no complete replayable folds"
+            )
     return training_config, fold_dirs_per_symbol
 
 

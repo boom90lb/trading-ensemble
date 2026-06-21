@@ -8,6 +8,7 @@ import pytest
 
 from src.data_loader import (
     BAR_TZ,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DataLoader,
     _parse_cache_range,
     _parse_dividends_payload,
@@ -93,11 +94,12 @@ def _ts_payload(start, end):
 @pytest.fixture
 def loader_with_counter(tmp_path, monkeypatch):
     """A DataLoader whose API calls are mocked and counted."""
-    calls = {"n": 0, "last_params": None}
+    calls = {"n": 0, "last_params": None, "last_timeout": None}
 
-    def fake_get(url, params=None):
+    def fake_get(url, params=None, timeout=None):
         calls["n"] += 1
         calls["last_params"] = params
+        calls["last_timeout"] = timeout
         return _FakeResp(_ts_payload(params["start_date"], params["end_date"]))
 
     monkeypatch.setattr("src.data_loader.requests.get", fake_get)
@@ -106,11 +108,12 @@ def loader_with_counter(tmp_path, monkeypatch):
 
 
 def test_fetch_localizes_index_to_bar_tz(loader_with_counter):
-    loader, _, _ = loader_with_counter
+    loader, calls, _ = loader_with_counter
     df = loader.fetch_historical_data("AAPL", "1d", "2021-01-01", "2021-03-01")
     assert isinstance(df.index, pd.DatetimeIndex)
     assert df.index.tz is not None
     assert str(df.index.tz) == BAR_TZ
+    assert calls["last_timeout"] == DEFAULT_REQUEST_TIMEOUT_SECONDS
 
 
 def test_cache_filename_encodes_requested_range(loader_with_counter):
@@ -218,10 +221,11 @@ def test_parse_dividends_payload_sums_same_ex_date():
 # fetch_dividends caching/filtering with a mocked endpoint
 # --------------------------------------------------------------------------- #
 def test_fetch_dividends_caches_filters_and_reuses(tmp_path, monkeypatch):
-    calls = {"n": 0}
+    calls = {"n": 0, "last_timeout": None}
 
-    def fake_get(url, params=None):
+    def fake_get(url, params=None, timeout=None):
         calls["n"] += 1
+        calls["last_timeout"] = timeout
         assert url.endswith("/dividends")
         return _FakeResp(
             {
@@ -237,6 +241,7 @@ def test_fetch_dividends_caches_filters_and_reuses(tmp_path, monkeypatch):
 
     s = loader.fetch_dividends("AAPL", "2021-01-01", "2021-12-31")
     assert calls["n"] == 1
+    assert calls["last_timeout"] == DEFAULT_REQUEST_TIMEOUT_SECONDS
     assert len(s) == 2
     assert (tmp_path / "AAPL_dividends_2021-01-01_2021-12-31.parquet").exists()
 

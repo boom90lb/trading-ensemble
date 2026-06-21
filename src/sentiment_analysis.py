@@ -24,6 +24,7 @@ import pandas as pd
 import requests
 
 from src.config import POLYGON_API_KEY
+from src.data_loader import DEFAULT_REQUEST_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -192,15 +193,21 @@ class SentimentAnalyzer:
         identical between the two (shared :func:`_bucket_articles_by_bar`).
     """
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ):
         """Initialize the sentiment analyzer.
 
         Args:
             api_key: Polygon.io API key (default: use from config)
+            request_timeout: HTTP request timeout in seconds.
         """
         self.api_key = POLYGON_API_KEY if api_key is None else api_key
         if not self.api_key:
             logger.warning("No Polygon API key provided, sentiment analysis will be limited")
+        self.request_timeout = float(request_timeout)
 
         # Cache for sentiment data
         self.sentiment_cache: Dict[str, Dict[pd.Timestamp, Dict]] = {}  # {symbol: {date: sentiment_data}}
@@ -245,7 +252,12 @@ class SentimentAnalyzer:
 
             # Make API request
             headers = {"Authorization": f"Bearer {self.api_key}"}
-            response = requests.get("https://api.polygon.io/v2/reference/news", params=params, headers=headers)  # type: ignore
+            response = requests.get(  # type: ignore
+                "https://api.polygon.io/v2/reference/news",
+                params=params,
+                headers=headers,
+                timeout=self.request_timeout,
+            )
             response.raise_for_status()
             data = response.json()
 

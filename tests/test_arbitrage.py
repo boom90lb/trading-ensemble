@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -20,7 +21,9 @@ from src.arbitrage import (
     generate_pair_positions,
     run_stat_arb_walk_forward,
     scan_cointegrated_pairs,
+    scan_cointegrated_pairs_with_report,
 )
+from src.arbitrage.pairs import _evidence_weights
 from src.config import ExecutionConfig
 
 
@@ -269,3 +272,176 @@ def test_walk_forward_selection_metadata_is_deterministic() -> None:
     first_reports = [fold_result_to_dict(fold)["selection_report"] for fold in first.folds]
     second_reports = [fold_result_to_dict(fold)["selection_report"] for fold in second.folds]
     assert first_reports == second_reports
+
+
+def _two_cointegrated_pairs_prices(n: int = 650) -> pd.DataFrame:
+    """Two independent cointegrated pairs of differing strength, plus no cross-pair link."""
+    rng = np.random.default_rng(7)
+    idx = pd.date_range("2020-01-01", periods=n, freq="B", tz="America/New_York")
+
+    def _pair(base_x: float, ar: float, noise: float, alpha: float, beta: float) -> tuple[np.ndarray, np.ndarray]:
+        log_x = np.cumsum(rng.normal(0.0002, 0.01, size=n)) + math.log(base_x)
+        spread = np.zeros(n)
+        for i in range(1, n):
+            spread[i] = ar * spread[i - 1] + rng.normal(0.0, noise)
+        log_y = alpha + beta * log_x + spread
+        return np.exp(log_y), np.exp(log_x)
+
+    aaa, bbb = _pair(100.0, ar=0.50, noise=0.008, alpha=0.15, beta=0.92)  # strong, fast reversion
+    ccc, ddd = _pair(80.0, ar=0.80, noise=0.018, alpha=0.10, beta=0.95)  # weaker, slower reversion
+    return pd.DataFrame({"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd}, index=idx)
+
+
+def _many_cointegrated_prices(n: int = 650) -> pd.DataFrame:
+    rng = np.random.default_rng(11)
+    idx = pd.date_range("2020-01-01", periods=n, freq="B", tz="America/New_York")
+    common = np.cumsum(rng.normal(0.0002, 0.01, size=n)) + math.log(100.0)
+    data = {}
+    for i, name in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"]):
+        spread = np.zeros(n)
+        for t in range(1, n):
+            spread[t] = 0.55 * spread[t - 1] + rng.normal(0.0, 0.004 + i * 0.001)
+        data[name] = np.exp(0.03 * i + (0.90 + 0.01 * i) * common + spread)
+    return pd.DataFrame(data, index=idx)
+
+
+def _strong_pair_with_noise_prices(n: int = 650) -> pd.DataFrame:
+    rng = np.random.default_rng(1)
+    idx = pd.date_range("2020-01-01", periods=n, freq="B", tz="America/New_York")
+
+    log_x = np.cumsum(rng.normal(0.0002, 0.01, size=n)) + math.log(100.0)
+    spread = np.zeros(n)
+    for i in range(1, n):
+        spread[i] = 0.45 * spread[i - 1] + rng.normal(0.0, 0.006)
+    log_y = 0.15 + 0.92 * log_x + spread
+
+    noise_one = np.cumsum(rng.normal(0.0001, 0.012, size=n)) + math.log(50.0)
+    noise_two = np.cumsum(rng.normal(-0.00005, 0.013, size=n)) + math.log(60.0)
+    return pd.DataFrame(
+        {
+            "AAA": np.exp(log_y),
+            "BBB": np.exp(log_x),
+            "NOI": np.exp(noise_one),
+            "NSY": np.exp(noise_two),
+        },
+        index=idx,
+    )
+
+
+def test_evidence_weights_shrink_toward_consensus() -> None:
+    assert _evidence_weights(np.array([])).size == 0
+    assert _evidence_weights(np.array([4.2])).tolist() == [1.0]
+    assert np.allclose(_evidence_weights(np.array([3.0, 3.0, 3.0])), 1.0)
+
+    w = _evidence_weights(np.array([5.0, 4.0, 3.0]))
+    assert w[0] == pytest.approx(1.0)  # strongest normalized to 1.0
+    assert w[0] > w[1] > w[2] > 0.0  # monotone in strength; weak signals kept, not dropped
+    assert w[2] > 3.0 / 5.0  # James-Stein compresses vs naive proportional weighting
+
+
+def test_fdr_hard_assigns_unit_evidence_weight() -> None:
+    prices = _synthetic_cointegrated_prices()
+    cfg = PairSelectionConfig(
+        min_obs=500,
+        max_pairs=3,
+        fdr_alpha=0.20,
+        min_abs_return_corr=0.2,
+        max_half_life=80.0,
+        max_beta_drift=0.75,
+    )
+    pairs = scan_cointegrated_pairs(prices, cfg)  # default construction_mode="fdr_hard"
+    assert pairs
+    assert all(p.evidence_weight == 1.0 for p in pairs)
+
+
+def test_shrunk_candidates_weight_by_strength_and_change_portfolio() -> None:
+    prices = _two_cointegrated_pairs_prices()
+    common = dict(
+        signal_config=PairSignalConfig(z_window=20, min_z_obs=10, entry_z=1.0, exit_z=0.2, stop_z=5.0),
+        walk_config=StatArbWalkForwardConfig(formation_bars=520, test_bars=60, min_test_bars=20),
+        execution=ExecutionConfig(spread_bps=0, commission_bps=0, slippage_coeff=0, borrow_rate_bps_annual=0),
+    )
+    hard_cfg = PairSelectionConfig(
+        min_obs=500,
+        max_pairs=6,
+        fdr_alpha=0.10,
+        min_abs_return_corr=0.0,
+        max_half_life=1_000.0,
+        max_beta_drift=10.0,
+    )
+    shrunk_cfg = replace(hard_cfg, construction_mode="shrunk_candidates")
+
+    hard = run_stat_arb_walk_forward(prices, _open_from_close(prices), selection_config=hard_cfg, **common)
+    shrunk = run_stat_arb_walk_forward(prices, _open_from_close(prices), selection_config=shrunk_cfg, **common)
+
+    shrunk_pairs = shrunk.folds[0].selected_pairs
+    assert len(shrunk_pairs) >= 2
+    weights = [p.evidence_weight for p in shrunk_pairs]
+    assert max(weights) == pytest.approx(1.0)  # normalized to the strongest
+    assert min(weights) < 1.0  # genuinely weighted, not a uniform full-size book
+    assert all(0.0 < w <= 1.0 for w in weights)
+
+    # The selection ledger carries the weight for claim-packet discipline.
+    assert "evidence_weight" in fold_result_to_dict(shrunk.folds[0])["selected_pairs"][0]
+
+    # Wider-or-equal search family -> at least as many DSR trials as the hard gate.
+    assert shrunk.summary["pair_trial_count"] >= hard.summary["pair_trial_count"]
+
+    # Evidence weighting changes the constructed book relative to the hard gate.
+    common_idx = hard.portfolio.target_weights.index.intersection(shrunk.portfolio.target_weights.index)
+    assert not np.allclose(
+        hard.portfolio.target_weights.loc[common_idx].to_numpy(),
+        shrunk.portfolio.target_weights.loc[common_idx].to_numpy(),
+    )
+
+
+def test_shrunk_candidates_noise_control_expands_trials_and_deflates_dsr() -> None:
+    prices = _strong_pair_with_noise_prices()
+    common = dict(
+        signal_config=PairSignalConfig(z_window=20, min_z_obs=10, entry_z=1.0, exit_z=0.2, stop_z=5.0),
+        walk_config=StatArbWalkForwardConfig(formation_bars=520, test_bars=60, min_test_bars=20),
+        execution=ExecutionConfig(spread_bps=0, commission_bps=0, slippage_coeff=0, borrow_rate_bps_annual=0),
+    )
+    hard_cfg = PairSelectionConfig(
+        min_obs=500,
+        max_pairs=6,
+        fdr_alpha=0.10,
+        max_coint_pvalue=0.99,
+        min_abs_return_corr=0.0,
+        max_half_life=1_000.0,
+        max_beta_drift=1_000.0,
+    )
+    shrunk_cfg = replace(hard_cfg, construction_mode="shrunk_candidates")
+
+    hard = run_stat_arb_walk_forward(prices, _open_from_close(prices), selection_config=hard_cfg, **common)
+    shrunk = run_stat_arb_walk_forward(prices, _open_from_close(prices), selection_config=shrunk_cfg, **common)
+
+    hard_noise = [p for f in hard.folds for p in f.selected_pairs if set(p.symbols) == {"NOI", "NSY"}]
+    shrunk_noise = [p for f in shrunk.folds for p in f.selected_pairs if set(p.symbols) == {"NOI", "NSY"}]
+
+    assert not hard_noise
+    assert shrunk_noise
+    assert max(p.evidence_weight for p in shrunk_noise) < 0.25
+    assert shrunk.summary["pair_trial_count"] > hard.summary["pair_trial_count"]
+    assert shrunk.summary["pair_set_dsr"] < hard.summary["pair_set_dsr"]
+
+
+def test_shrunk_candidates_honors_max_pairs_and_counts_omissions() -> None:
+    prices = _many_cointegrated_prices()
+    report = scan_cointegrated_pairs_with_report(
+        prices,
+        PairSelectionConfig(
+            min_obs=500,
+            max_pairs=2,
+            fdr_alpha=0.99,
+            max_coint_pvalue=0.99,
+            min_abs_return_corr=0.0,
+            max_half_life=1_000.0,
+            max_beta_drift=1_000.0,
+            construction_mode="shrunk_candidates",
+        ),
+    )
+
+    assert len(report.selected_candidates) == 2
+    assert report.rejection_counts["max_pairs"] > 0
+    assert [p.evidence_weight for p in report.selected_candidates][0] == pytest.approx(1.0)

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.arbitrage import PairCandidate
 from src.execution.target_weights import backtest_target_weights
@@ -283,3 +284,39 @@ def test_rl_seed_eval_main_emits_member_claim_packet(monkeypatch, tmp_path: Path
 
     packet = validate_claim_packet_dir(out_dir / "lstm_ppo")
     assert packet["strategy"] == "rl_member_seed_robustness"
+
+
+def test_rl_seed_eval_rejects_sentiment_before_data_loading(monkeypatch, tmp_path: Path) -> None:
+    import scripts.rl_seed_eval as mod
+
+    training_run = tmp_path / "training_run"
+    fold_dir = training_run / "AAA" / "fold_0"
+    fold_dir.mkdir(parents=True)
+    config = {
+        "prediction_horizon": 1,
+        "timeframe": "1d",
+        "start_date": "2026-01-02",
+        "end_date": None,
+        "use_sentiment": True,
+    }
+
+    class _Loader:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("DataLoader should not be constructed")
+
+    monkeypatch.setattr(mod, "DataLoader", _Loader)
+    monkeypatch.setattr(mod, "load_training_run", lambda _path: (config, {"AAA": [fold_dir]}))
+    monkeypatch.setattr(sys, "argv", [
+        "rl_seed_eval.py",
+        "--training_run",
+        str(training_run),
+        "--members",
+        "lstm_ppo",
+        "--seeds",
+        "0",
+        "--output_dir",
+        str(tmp_path / "out"),
+    ])
+
+    with pytest.raises(ValueError, match="sentiment is disabled for rl_seed_eval"):
+        mod.main()

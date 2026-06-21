@@ -154,6 +154,21 @@ def build_fold_metadata(
     }
 
 
+def write_fold_status(
+    fold_dir: Path,
+    *,
+    status: str,
+    error: Exception | None = None,
+) -> None:
+    """Persist whether a fold produced a complete replayable artifact set."""
+    payload: Dict[str, Any] = {"status": status}
+    if error is not None:
+        payload["exception_type"] = type(error).__name__
+        payload["exception_message"] = str(error)
+    with open(fold_dir / "fold_status.json", "w") as f:
+        json.dump(payload, f, indent=2)
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -528,6 +543,7 @@ def train_symbol_wfo(
                 f"Error fitting ensemble for {symbol} fold {fold_idx}: {e}",
                 exc_info=True,
             )
+            write_fold_status(fold_dir, status="failed", error=e)
             continue
 
         metrics = ensemble.evaluate(X_test, y_test)
@@ -566,6 +582,7 @@ def train_symbol_wfo(
             train_idx=train_idx,
             test_idx=test_idx,
         )
+        write_fold_status(fold_dir, status="complete")
 
     if per_fold_metrics:
         aggregated = aggregate_fold_metrics(per_fold_metrics)

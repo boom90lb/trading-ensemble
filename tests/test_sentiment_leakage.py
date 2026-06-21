@@ -15,7 +15,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from src.data_loader import BAR_TZ, _ensure_bar_tz
+from src.data_loader import BAR_TZ, DEFAULT_REQUEST_TIMEOUT_SECONDS, _ensure_bar_tz
 from src.sentiment_analysis import SentimentAnalyzer
 
 
@@ -123,6 +123,33 @@ def test_no_api_key_returns_empty_features(analyzer):
 def test_empty_dates_returns_empty(analyzer):
     df = analyzer.create_sentiment_features("AAPL", pd.DatetimeIndex([], tz="America/New_York"))
     assert df.empty
+
+
+def test_fetch_news_passes_default_timeout(monkeypatch):
+    calls = {"timeout": None}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"status": "OK", "results": []}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls["timeout"] = timeout
+        assert url.endswith("/v2/reference/news")
+        assert headers["Authorization"] == "Bearer test-key"
+        return _Resp()
+
+    monkeypatch.setattr("src.sentiment_analysis.requests.get", fake_get)
+    out = SentimentAnalyzer(api_key="test-key").fetch_news(
+        "AAPL",
+        start_date="2023-01-01",
+        end_date="2023-01-31",
+    )
+
+    assert out == []
+    assert calls["timeout"] == DEFAULT_REQUEST_TIMEOUT_SECONDS
 
 
 def test_no_articles_returns_zeros_not_nan(analyzer):

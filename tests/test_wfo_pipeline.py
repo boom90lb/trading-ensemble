@@ -203,8 +203,9 @@ def test_finalize_results_derived_columns():
         index=pd.bdate_range("2024-01-02", periods=4),
     )
     out = TradingStrategy._finalize_results(seg)
-    assert list(out.columns) == ["portfolio_value", "cash", "daily_return",
-                                  "cumulative_return", "drawdown"]
+    assert list(out.columns) == [
+        "portfolio_value", "cash", "daily_return", "cumulative_return", "drawdown",
+    ]
     # daily_return[1] = 110/100 - 1 = 0.10
     assert out["daily_return"].iloc[1] == pytest.approx(0.10)
     # cumulative_return[3] should reflect 121/100 - 1 = 0.21
@@ -569,6 +570,8 @@ def test_train_symbol_wfo_produces_per_fold_artifacts(monkeypatch, tmp_path):
         assert (d / "ensemble_model").is_dir()
         assert (d / "feature_engineer_state.pkl").exists()
         assert (d / "fold_metadata.json").exists()
+        status = json.loads((d / "fold_status.json").read_text())
+        assert status["status"] == "complete"
         sidx = np.load(d / "split_idx.npz")
         assert sidx["train_idx"].size > 0 and sidx["test_idx"].size > 0
         test_idx_sets.append(set(sidx["test_idx"].tolist()))
@@ -581,7 +584,6 @@ def test_train_symbol_wfo_produces_per_fold_artifacts(monkeypatch, tmp_path):
     # fold_metrics.json present + aggregated.
     metrics_path = symbol_dir / "fold_metrics.json"
     assert metrics_path.exists()
-    import json
     with open(metrics_path) as f:
         payload = json.load(f)
     assert len(payload["per_fold"]) == len(fold_dirs) == len(per_fold)
@@ -599,6 +601,116 @@ def test_train_symbol_wfo_produces_per_fold_artifacts(monkeypatch, tmp_path):
     sample_metric = fold_metric_names[0]
     history = client.get_metric_history(nested_run_id, sample_metric)
     assert {h.step for h in history} >= set(range(len(fold_dirs)))
+
+
+def test_train_symbol_wfo_writes_failed_fold_status(monkeypatch, tmp_path):
+    import types
+
+    import scripts.training as training_mod
+    from scripts.training import build_features, train_symbol_wfo
+    from src.config import ModelConfig, TrainingConfig
+    from src.features import FeatureEngineer
+    from src.validation.walk_forward import PurgedWalkForward
+
+    monkeypatch.setattr(training_mod, "log_params_safe", lambda *a, **k: None)
+    monkeypatch.setattr(training_mod, "log_metrics_safe", lambda *a, **k: None)
+
+    class _FailingEnsemble:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fit(self, *args, **kwargs):
+            raise RuntimeError("intentional fold failure")
+
+    monkeypatch.setattr(training_mod, "EnsembleModel", _FailingEnsemble)
+
+    raw = _make_gbm_df(n=120, seed=17)
+    fe = FeatureEngineer()
+    full_df = build_features(
+        raw_df=raw,
+        symbol="SYM",
+        feature_engineer=fe,
+        sentiment_analyzer=None,
+        horizon=5,
+    )
+    training_config = TrainingConfig(
+        symbols=["SYM"],
+        timeframe="1d",
+        start_date="2024-01-02",
+        prediction_horizon=5,
+        n_splits=2,
+        embargo_pct=0.01,
+        expanding=True,
+    )
+    splitter = PurgedWalkForward(
+        n_splits=training_config.n_splits,
+        purge_horizon=training_config.effective_purge_horizon,
+        embargo_pct=training_config.embargo_pct,
+        expanding=training_config.expanding,
+    )
+    symbol_dir = tmp_path / "out" / "SYM"
+    args = types.SimpleNamespace(rl_timesteps=0, checkpoint_freq=0, gpu=False)
+
+    per_fold = train_symbol_wfo(
+        symbol="SYM",
+        full_df=full_df,
+        target_col="target_5",
+        splitter=splitter,
+        model_configs=[ModelConfig(name="xgboost", enabled=True, weight=1.0)],
+        model_names=["xgboost"],
+        training_config=training_config,
+        args=args,
+        gpu_available=False,
+        feature_engineer=fe,
+        symbol_dir=symbol_dir,
+    )
+
+    assert per_fold == []
+    fold_dirs = sorted(d for d in symbol_dir.glob("fold_*") if d.is_dir())
+    assert fold_dirs
+    for fold_dir in fold_dirs:
+        status = json.loads((fold_dir / "fold_status.json").read_text())
+        assert status["status"] == "failed"
+        assert status["exception_type"] == "RuntimeError"
+        assert status["exception_message"] == "intentional fold failure"
+
+
+def test_load_training_run_ignores_incomplete_folds(tmp_path):
+    from scripts.backtest import load_training_run
+
+    training_run = tmp_path / "training_run"
+    symbol_dir = training_run / "AAA"
+    complete = symbol_dir / "fold_0"
+    incomplete = symbol_dir / "fold_1"
+    (complete / "ensemble_model").mkdir(parents=True)
+    incomplete.mkdir(parents=True)
+    (training_run / "training_config.json").write_text(
+        json.dumps({"prediction_horizon": 5})
+    )
+    (complete / "fold_metadata.json").write_text("{}")
+    (complete / "feature_engineer_state.pkl").write_bytes(b"state")
+    (complete / "ensemble_model" / "ensemble_state_h5.pkl").write_bytes(b"model")
+    np.savez(complete / "split_idx.npz", train_idx=np.array([0]), test_idx=np.array([1]))
+    np.savez(incomplete / "split_idx.npz", train_idx=np.array([0]), test_idx=np.array([1]))
+
+    _, folds = load_training_run(training_run)
+
+    assert folds == {"AAA": [complete]}
+
+
+def test_load_training_run_raises_when_only_incomplete_folds(tmp_path):
+    from scripts.backtest import load_training_run
+
+    training_run = tmp_path / "training_run"
+    fold_dir = training_run / "AAA" / "fold_0"
+    fold_dir.mkdir(parents=True)
+    (training_run / "training_config.json").write_text(
+        json.dumps({"prediction_horizon": 5})
+    )
+    np.savez(fold_dir / "split_idx.npz", train_idx=np.array([0]), test_idx=np.array([1]))
+
+    with pytest.raises(ValueError, match="AAA has 1 incomplete fold dirs"):
+        load_training_run(training_run)
 
 
 def test_backtest_wfo_persists_state_and_drops_pending_between_folds(

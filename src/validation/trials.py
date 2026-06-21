@@ -12,7 +12,7 @@ import hashlib
 import json
 import math
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -36,9 +36,22 @@ CLAIM_TIERS = (
     CLAIM_ROBUST_EDGE,
 )
 
-TRIAL_PACKET_SCHEMA_VERSION = 1
+TRIAL_PACKET_SCHEMA_VERSION = 2
 DEFAULT_ROBUST_DSR_THRESHOLD = 0.95
 DEFAULT_MIN_OBS = 20
+
+
+@dataclass(frozen=True)
+class GitCodeState:
+    """Hashed git provenance for a research artifact."""
+
+    available: bool
+    commit: str | None
+    dirty: bool | None
+    tracked_diff_hash: str | None
+    untracked_count: int | None
+    untracked_paths_hash: str | None
+    status_hash: str | None
 
 
 @dataclass(frozen=True)
@@ -51,6 +64,7 @@ class ResearchClaimPacket:
     claim_tier: str
     config_hash: str
     code_commit: str | None
+    code_state: GitCodeState
     data: dict[str, Any]
     config: dict[str, Any]
     metrics: dict[str, Any]
@@ -100,20 +114,69 @@ def stable_config_hash(payload: Mapping[str, Any], length: int = 12) -> str:
     return hashlib.sha256(stable_json_dumps(payload).encode("utf-8")).hexdigest()[:length]
 
 
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _git_stdout(args: list[str], cwd: Path | str | None) -> bytes:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd is not None else None,
+        check=True,
+        capture_output=True,
+    )
+    return completed.stdout or b""
+
+
+def current_git_state(cwd: Path | str | None = None) -> GitCodeState:
+    """Return hashed git state for the current checkout, or unavailable state."""
+    try:
+        commit = _git_stdout(["rev-parse", "HEAD"], cwd).decode("utf-8", errors="replace").strip() or None
+        tracked_diff = _git_stdout(["diff", "--binary", "--no-ext-diff", "HEAD", "--"], cwd)
+        untracked_paths = _git_stdout(["ls-files", "--others", "--exclude-standard", "-z"], cwd)
+        status = _git_stdout(["status", "--porcelain=v1", "-z"], cwd)
+    except Exception:
+        return GitCodeState(
+            available=False,
+            commit=None,
+            dirty=None,
+            tracked_diff_hash=None,
+            untracked_count=None,
+            untracked_paths_hash=None,
+            status_hash=None,
+        )
+
+    untracked_count = sum(1 for item in untracked_paths.split(b"\0") if item)
+    return GitCodeState(
+        available=True,
+        commit=commit,
+        dirty=bool(status),
+        tracked_diff_hash=_sha256_bytes(tracked_diff),
+        untracked_count=untracked_count,
+        untracked_paths_hash=_sha256_bytes(untracked_paths),
+        status_hash=_sha256_bytes(status),
+    )
+
+
 def current_git_commit(cwd: Path | str | None = None) -> str | None:
     """Return the current git commit, or None when unavailable."""
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(cwd) if cwd is not None else None,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except Exception:
-        return None
-    commit = completed.stdout.strip()
-    return commit or None
+    return current_git_state(cwd).commit
+
+
+def _coerce_git_code_state(value: GitCodeState | Mapping[str, Any] | None) -> GitCodeState:
+    if value is None:
+        return current_git_state()
+    if isinstance(value, GitCodeState):
+        return value
+    return GitCodeState(
+        available=bool(value.get("available", False)),
+        commit=value.get("commit"),
+        dirty=value.get("dirty"),
+        tracked_diff_hash=value.get("tracked_diff_hash"),
+        untracked_count=value.get("untracked_count"),
+        untracked_paths_hash=value.get("untracked_paths_hash"),
+        status_hash=value.get("status_hash"),
+    )
 
 
 def _finite_returns(returns: pd.Series | np.ndarray | list[float]) -> pd.Series:
@@ -262,6 +325,7 @@ def build_research_claim_packet(
     summary: Mapping[str, Any] | None = None,
     artifacts: Mapping[str, str | Path] | None = None,
     code_commit: str | None = None,
+    code_state: GitCodeState | Mapping[str, Any] | None = None,
     created_at: datetime | None = None,
     robust_dsr_threshold: float = DEFAULT_ROBUST_DSR_THRESHOLD,
     min_obs: int = DEFAULT_MIN_OBS,
@@ -284,6 +348,11 @@ def build_research_claim_packet(
     timestamp = created_at or datetime.now(timezone.utc)
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
+    resolved_code_state = _coerce_git_code_state(code_state)
+    if code_commit is None:
+        code_commit = resolved_code_state.commit
+    elif resolved_code_state.commit is None:
+        resolved_code_state = replace(resolved_code_state, commit=code_commit)
     return ResearchClaimPacket(
         schema_version=TRIAL_PACKET_SCHEMA_VERSION,
         created_at_utc=timestamp.astimezone(timezone.utc).isoformat(),
@@ -291,6 +360,7 @@ def build_research_claim_packet(
         claim_tier=tier,
         config_hash=stable_config_hash(config_payload),
         code_commit=code_commit,
+        code_state=resolved_code_state,
         data=_to_jsonable(data),
         config=_to_jsonable(config),
         metrics=metrics,
@@ -350,6 +420,8 @@ REQUIRED_PACKET_KEYS: tuple[str, ...] = (
     "strategy",
     "claim_tier",
     "config_hash",
+    "code_commit",
+    "code_state",
     "data",
     "config",
     "metrics",
@@ -397,6 +469,16 @@ def validate_claim_packet_dir(
         )
     if packet["claim_tier"] not in CLAIM_TIERS:
         raise ValueError(f"claim packet has unknown claim_tier {packet['claim_tier']!r}: {packet_path}")
+
+    code_state = packet["code_state"]
+    if not isinstance(code_state, Mapping):
+        raise ValueError(f"claim packet code_state is not an object: {packet_path}")
+    missing_code_state = [
+        key for key in GitCodeState.__dataclass_fields__
+        if key not in code_state
+    ]
+    if missing_code_state:
+        raise ValueError(f"claim packet code_state missing keys {missing_code_state}: {packet_path}")
 
     artifacts = packet["artifacts"]
     if not isinstance(artifacts, Mapping):

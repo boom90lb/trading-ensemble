@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
+import hashlib
 import json
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -15,8 +18,12 @@ from src.validation.trials import (
     CLAIM_NO_CLAIM,
     CLAIM_ROBUST_EDGE,
     REQUIRED_PACKET_KEYS,
+    GitCodeState,
+    TRIAL_PACKET_SCHEMA_VERSION,
     build_research_claim_packet,
     classify_claim_tier,
+    current_git_commit,
+    current_git_state,
     emit_research_claim_packet,
     stable_config_hash,
     summary_claim_fields,
@@ -78,7 +85,52 @@ def test_build_packet_computes_cost_adjusted_gross_metrics() -> None:
     assert packet.code_commit == "abc123"
 
 
+def test_current_git_state_hashes_dirty_material(monkeypatch) -> None:
+    tracked_diff = b"diff --git a/secret.py b/secret.py\n+TOKEN=abc\n"
+    untracked_paths = b".env\0scratch/note.txt\0"
+    status = b" M secret.py\0?? .env\0?? scratch/note.txt\0"
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs["check"] is True
+        assert kwargs["capture_output"] is True
+        if cmd[1:] == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"abc123\n")
+        if cmd[1:] == ["diff", "--binary", "--no-ext-diff", "HEAD", "--"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=tracked_diff)
+        if cmd[1:] == ["ls-files", "--others", "--exclude-standard", "-z"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=untracked_paths)
+        if cmd[1:] == ["status", "--porcelain=v1", "-z"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=status)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr("src.validation.trials.subprocess.run", fake_run)
+
+    state = current_git_state("/repo")
+    assert state.available is True
+    assert state.commit == "abc123"
+    assert state.dirty is True
+    assert state.tracked_diff_hash == hashlib.sha256(tracked_diff).hexdigest()
+    assert state.untracked_count == 2
+    assert state.untracked_paths_hash == hashlib.sha256(untracked_paths).hexdigest()
+    assert state.status_hash == hashlib.sha256(status).hexdigest()
+    assert current_git_commit("/repo") == "abc123"
+
+    serialized = json.dumps(asdict(state), sort_keys=True)
+    assert "TOKEN=abc" not in serialized
+    assert ".env" not in serialized
+    assert "scratch/note.txt" not in serialized
+
+
 def test_packet_writer_emits_strict_json(tmp_path) -> None:
+    code_state = GitCodeState(
+        available=True,
+        commit="abc123",
+        dirty=True,
+        tracked_diff_hash="tracked_hash",
+        untracked_count=1,
+        untracked_paths_hash="untracked_hash",
+        status_hash="status_hash",
+    )
     packet = build_research_claim_packet(
         strategy="flat",
         config={"param": float("nan")},
@@ -86,6 +138,7 @@ def test_packet_writer_emits_strict_json(tmp_path) -> None:
         returns=[0.0] * 30,
         summary={"dsr": float("nan")},
         artifacts={"returns": "returns.csv"},
+        code_state=code_state,
     )
     assert packet.claim_tier == CLAIM_MECHANICS_CLEAN
 
@@ -93,7 +146,9 @@ def test_packet_writer_emits_strict_json(tmp_path) -> None:
     write_research_claim_packet(packet, out)
     loaded = json.loads(out.read_text())
 
-    assert loaded["schema_version"] == 1
+    assert loaded["schema_version"] == TRIAL_PACKET_SCHEMA_VERSION == 2
+    assert loaded["code_commit"] == "abc123"
+    assert loaded["code_state"] == asdict(code_state)
     assert loaded["config"]["param"] is None
     assert loaded["metrics"]["dsr"] is None
     assert loaded["artifacts"]["returns"] == "returns.csv"

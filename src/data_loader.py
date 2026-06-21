@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 # ET; sentiment_analysis joins UTC news against (idx + 16h) as the bar close time.
 BAR_TZ = "America/New_York"
 BAR_CLOSE_HOUR = 16
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
 def _ensure_bar_tz(df: pd.DataFrame) -> pd.DataFrame:
@@ -133,12 +134,18 @@ def _to_vendor_interval(interval: str) -> str:
 class DataLoader:
     """Data loader class for fetching and preparing time series data."""
 
-    def __init__(self, api_key: Optional[str] = None, cache_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        cache_dir: Optional[Path] = None,
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ):
         """Initialize the data loader.
 
         Args:
             api_key: Twelvedata API key (default: use from config)
             cache_dir: Directory for caching data (default: use from config)
+            request_timeout: HTTP request timeout in seconds.
         """
         self.api_key = api_key or TWELVEDATA_API_KEY
         if not self.api_key:
@@ -146,6 +153,7 @@ class DataLoader:
 
         self.cache_dir = cache_dir or DATA_DIR
         self.cache_dir.mkdir(exist_ok=True, parents=True)
+        self.request_timeout = float(request_timeout)
 
     def _find_covering_cache(
         self, symbol: str, interval: str, req_start: Optional[str], req_end: str
@@ -255,7 +263,11 @@ class DataLoader:
                 params["end_date"] = end_date
 
             # Make API request
-            response = requests.get("https://api.twelvedata.com/time_series", params=params)  # type: ignore
+            response = requests.get(  # type: ignore
+                "https://api.twelvedata.com/time_series",
+                params=params,
+                timeout=self.request_timeout,
+            )
             response.raise_for_status()
             data = response.json()
 
@@ -359,7 +371,11 @@ class DataLoader:
         if end_date:
             params["end_date"] = end_date
         try:
-            response = requests.get("https://api.twelvedata.com/dividends", params=params)
+            response = requests.get(
+                "https://api.twelvedata.com/dividends",
+                params=params,
+                timeout=self.request_timeout,
+            )
             response.raise_for_status()
             return _parse_dividends_payload(response.json())
         except Exception as e:
