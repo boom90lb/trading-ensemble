@@ -39,7 +39,10 @@ def test_r0_quarantine_defaults_and_explicit_rejections(monkeypatch) -> None:
         reject_sentiment_flag,
     )
 
-    assert "lstm" not in parse_model_names(DEFAULT_MODEL_SELECTION)
+    default_models = parse_model_names(DEFAULT_MODEL_SELECTION)
+    assert "lstm" not in default_models
+    assert "arima" not in default_models
+    assert "prophet" not in default_models
     monkeypatch.setattr(sys, "argv", ["sweep.py"])
     assert parse_model_names(sweep_mod.parse_args().models) == ["xgboost"]
 

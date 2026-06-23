@@ -203,12 +203,16 @@ def _make_synthetic_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
     return df
 
 
+def _forward_return(df: pd.DataFrame, horizon: int) -> pd.Series:
+    return df["close"].shift(-horizon).div(df["close"]).sub(1.0).dropna()
+
+
 def test_ensemble_fits_conformal_during_fit():
     """An xgboost-only ensemble with dynamic weighting should populate
     self.conformal and self.aci after fit()."""
     df = _make_synthetic_frame(n=300)
     horizon = 5
-    y = df["close"].shift(-horizon).dropna()
+    y = _forward_return(df, horizon)
     X = df.loc[y.index]
 
     ensemble = EnsembleModel(
@@ -233,7 +237,7 @@ def test_ensemble_fits_conformal_during_fit():
 def test_ensemble_predict_band_returns_ordered_triple():
     df = _make_synthetic_frame(n=300)
     horizon = 5
-    y = df["close"].shift(-horizon).dropna()
+    y = _forward_return(df, horizon)
     X = df.loc[y.index]
 
     ensemble = EnsembleModel(
@@ -259,7 +263,7 @@ def test_ensemble_predict_band_returns_ordered_triple():
 def test_ensemble_predict_band_widens_after_miscoverage():
     df = _make_synthetic_frame(n=300)
     horizon = 5
-    y = df["close"].shift(-horizon).dropna()
+    y = _forward_return(df, horizon)
     X = df.loc[y.index]
 
     ensemble = EnsembleModel(
@@ -287,13 +291,13 @@ def test_ensemble_predict_band_widens_after_miscoverage():
 
 def test_conformal_persists_in_save_load(tmp_path: Path):
     """Conformal state (EnbPI residuals + ACI alpha_t) persists through
-    save/load. Note: forecast member models (xgboost, lstm, etc.) are not
+    save/load. Note: forecast member models (xgboost, etc.) are not
     persisted by EnsembleModel.save(), so predict_band falls back to max-width
     bands when the model is unfitted post-load — but the conformal state
     itself is preserved."""
     df = _make_synthetic_frame(n=300)
     horizon = 5
-    y = df["close"].shift(-horizon).dropna()
+    y = _forward_return(df, horizon)
     X = df.loc[y.index]
 
     ensemble = EnsembleModel(
@@ -334,7 +338,7 @@ def test_ensemble_predict_band_noop_when_unfitted_conformal():
     """
     df = _make_synthetic_frame(n=200)
     horizon = 5
-    y = df["close"].shift(-horizon).dropna()
+    y = _forward_return(df, horizon)
     X = df.loc[y.index]
 
     ensemble = EnsembleModel(
@@ -350,6 +354,26 @@ def test_ensemble_predict_band_noop_when_unfitted_conformal():
     assert ensemble.conformal is None
     lower, point, upper = ensemble.predict_band(X.iloc[-5:])
     # Fallback: maximally wide bands == ±position_cap.
+    assert np.allclose(lower, -ensemble.position_cap)
+    assert np.allclose(upper, ensemble.position_cap)
+
+
+def test_predict_band_accepts_precomputed_point(monkeypatch):
+    ensemble = EnsembleModel(
+        target_column="close",
+        horizon=5,
+        config=EnsembleConfig(models=[]),
+    )
+    X = pd.DataFrame({"close": [100.0, 101.0, 102.0]})
+    precomputed = np.array([0.1, -0.2, 0.0])
+
+    def _unexpected_predict(*args, **kwargs):
+        raise AssertionError("predict_band recomputed predict despite point=")
+
+    monkeypatch.setattr(ensemble, "predict", _unexpected_predict)
+    lower, point, upper = ensemble.predict_band(X, point=precomputed)
+
+    np.testing.assert_array_equal(point, precomputed)
     assert np.allclose(lower, -ensemble.position_cap)
     assert np.allclose(upper, ensemble.position_cap)
 

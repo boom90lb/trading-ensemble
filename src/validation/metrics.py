@@ -202,6 +202,51 @@ def deflated_sharpe_ratio(
     return _psr_from_stats(sr, n, sr_null, g3, g4)
 
 
+def expected_max_sharpe_with_n(trial_sharpes: ArrayLike, n_trials: int) -> float:
+    """``expected_max_sharpe`` with an explicit trial count N (>= observed).
+
+    Uses the observed cross-trial Sharpe dispersion but raises the benchmark to a
+    pre-registered design-grid size, so a run can be deflated against the number of
+    configurations *searched* (the False Strategy Theorem's N) rather than only the
+    number written to the ledger. ``n_trials`` is floored at the observed count, so
+    ``expected_max_sharpe`` is the special case N == len(trial_sharpes).
+    """
+    arr = _to_array(trial_sharpes)
+    n_obs = arr.size
+    N = max(int(n_trials), n_obs)
+    if N < 2 or n_obs < 2:
+        return float("nan")
+    sr_std = arr.std(ddof=1)
+    if not np.isfinite(sr_std) or sr_std < _STD_FLOOR:
+        return 0.0
+    z = (1.0 - EULER_GAMMA) * norm.ppf(1.0 - 1.0 / N) + EULER_GAMMA * norm.ppf(
+        1.0 - 1.0 / (N * math.e)
+    )
+    return float(sr_std * z)
+
+
+def deflated_sharpe_ratio_with_n(
+    returns: ArrayLike,
+    trial_sharpes: ArrayLike,
+    n_trials: int,
+) -> float:
+    """``deflated_sharpe_ratio`` deflated against an explicit N (>= observed).
+
+    Identical PSR core (same skew/kurtosis adjustment) as ``deflated_sharpe_ratio``;
+    only the benchmark trial count differs, via ``expected_max_sharpe_with_n``. Lets
+    the residual path deflate against a pre-registered researcher design grid rather
+    than the handful of runs in the ledger (audit V-2 interim floor).
+    """
+    sr_null = expected_max_sharpe_with_n(trial_sharpes, n_trials)
+    if not np.isfinite(sr_null):
+        return float("nan")
+    stats = _sharpe_and_moments(returns)
+    if stats is None:
+        return float("nan")
+    sr, n, g3, g4 = stats
+    return _psr_from_stats(sr, n, sr_null, g3, g4)
+
+
 def calmar_ratio(annualized_return: float, max_drawdown: float) -> float:
     """Calmar = annualized_return / |max_drawdown|.
 

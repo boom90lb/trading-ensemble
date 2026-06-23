@@ -9,8 +9,8 @@ against the pre-fix code and passes after the corresponding fix:
      trades in every backtest fold. (commit: persist & reload forecast members)
   2. Prophet.fit/predict received a tz-aware ``ds`` → "Column ds has timezone
      specified" → Prophet fit failed every fold. (same commit)
-  3. run_segment fed model.predict the target_/direction_ LABEL columns, which
-     training drops before fitting → XGBoost feature_names mismatch on every
+  3. run_segment fed model.predict forward-label columns, which training drops
+     before fitting → XGBoost feature_names mismatch on every
      bar → member contributed nothing. (commit: exclude label cols)
 
 These use a forecast-only ensemble (arima + xgboost) so the assertions don't
@@ -27,7 +27,7 @@ import pandas as pd
 import pytest
 
 from src.config import EnsembleConfig, ModelConfig
-from src.features import FeatureEngineer
+from src.features import FeatureEngineer, forward_return_column, is_label_column
 from src.models.ensemble import EnsembleModel
 
 
@@ -51,9 +51,10 @@ def _make_gbm_df(n: int, seed: int = 7, start: str = "2021-01-04") -> pd.DataFra
 
 def _build_enhanced(n: int, horizon: int) -> tuple[pd.DataFrame, str, FeatureEngineer]:
     """Mirror scripts/training.build_features exactly: features + lags + target,
-    then ``clean_data_for_training`` (Inf→NaN, drop >30%-NaN cols, ffill,
-    fillna(0)) which is what removes the warmup-period NaNs Prophet rejects,
-    then drop rows with no forward label. Returns (usable, target_col, fe)."""
+    then ``clean_data_for_training`` (Inf->NaN, drop >30%-NaN feature cols,
+    feature ffill/fillna(0)) which removes the warmup-period feature NaNs
+    Prophet rejects while preserving missing forward labels. Returns
+    (usable, target_col, fe)."""
     from scripts.training import clean_data_for_training
 
     fe = FeatureEngineer()
@@ -61,7 +62,7 @@ def _build_enhanced(n: int, horizon: int) -> tuple[pd.DataFrame, str, FeatureEng
     df = fe.create_lagged_features(df, [1, 2, 5, 10])
     df = fe.create_target_variable(df, "close", horizon)
     df = clean_data_for_training(df)
-    target_col = f"target_{horizon}"
+    target_col = forward_return_column(horizon)
     return df.dropna(subset=[target_col]).copy(), target_col, fe
 
 
@@ -77,8 +78,9 @@ def _fit_forecast_ensemble(members: list[str]):
     train_scaled = fe.transform_features(train_raw, "SYM", is_train=True)
     test_scaled = fe.transform_features(test_raw, "SYM", is_train=False)
 
-    drop = [c for c in train_scaled.columns if "target_" in c or "direction_" in c]
+    drop = [c for c in train_scaled.columns if is_label_column(c)]
     X_train = train_scaled.drop(columns=drop)
+    assert not any(is_label_column(c) for c in X_train.columns)
     y_train = train_scaled[target_col]
     X_test = test_scaled.drop(columns=drop).reindex(columns=X_train.columns, fill_value=0)
 
@@ -164,7 +166,7 @@ def test_prophet_fits_on_tz_aware_index():
 # --------------------------------------------------------------------------
 def test_predict_with_label_columns_present_still_works():
     """XGBoost validates feature names strictly. If the backtest passes a frame
-    that still contains target_/direction_ columns, the per-bar predict raised a
+    that still contains forward-label columns, the per-bar predict raised a
     feature_names mismatch. After the run_segment fix those columns are dropped
     before predict; this asserts the ensemble predicts cleanly once they are."""
     horizon = 5
@@ -175,8 +177,9 @@ def test_predict_with_label_columns_present_still_works():
     train_scaled = fe.transform_features(train_raw, "SYM", is_train=True)
     test_scaled = fe.transform_features(test_raw, "SYM", is_train=False)
 
-    drop = [c for c in train_scaled.columns if "target_" in c or "direction_" in c]
+    drop = [c for c in train_scaled.columns if is_label_column(c)]
     X_train = train_scaled.drop(columns=drop)
+    assert not any(is_label_column(c) for c in X_train.columns)
     y_train = train_scaled[target_col]
 
     ensemble = EnsembleModel(
@@ -190,7 +193,7 @@ def test_predict_with_label_columns_present_still_works():
     ensemble.fit(X_train, y_train)
 
     # Emulate run_segment's fixed column selection (drop label cols).
-    label_cols = [c for c in test_scaled.columns if "target_" in c or "direction_" in c]
+    label_cols = [c for c in test_scaled.columns if is_label_column(c)]
     assert label_cols, "fixture must contain label columns to exercise the drop"
     feat = test_scaled.drop(columns=label_cols).reindex(columns=X_train.columns, fill_value=0)
 
@@ -216,8 +219,9 @@ def test_evaluate_tolerates_some_nan_predictions(monkeypatch):
     fe.fit_scalers(train_raw, "SYM")
     train_scaled = fe.transform_features(train_raw, "SYM", is_train=True)
     test_scaled = fe.transform_features(test_raw, "SYM", is_train=False)
-    drop = [c for c in train_scaled.columns if "target_" in c or "direction_" in c]
+    drop = [c for c in train_scaled.columns if is_label_column(c)]
     X_train = train_scaled.drop(columns=drop)
+    assert not any(is_label_column(c) for c in X_train.columns)
     y_train = train_scaled[target_col]
     X_test = test_scaled.drop(columns=drop).reindex(columns=X_train.columns, fill_value=0)
     y_test = test_scaled[target_col]
@@ -262,8 +266,9 @@ def test_train_serve_prediction_parity_from_fold_feature_state(tmp_path: Path):
     train_scaled = fe.transform_features(train_raw, "SYM", is_train=True)
     test_scaled = fe.transform_features(test_raw, "SYM", is_train=False)
 
-    drop = [c for c in train_scaled.columns if "target_" in c or "direction_" in c]
+    drop = [c for c in train_scaled.columns if is_label_column(c)]
     X_train = train_scaled.drop(columns=drop)
+    assert not any(is_label_column(c) for c in X_train.columns)
     y_train = train_scaled[target_col]
     X_test = test_scaled.drop(columns=drop).reindex(columns=X_train.columns)
 
@@ -307,6 +312,57 @@ def test_train_serve_prediction_parity_from_fold_feature_state(tmp_path: Path):
     )
 
 
+def test_meta_learner_can_leave_cash_unallocated(monkeypatch):
+    idx = pd.bdate_range("2026-01-01", periods=30)
+    X = pd.DataFrame({"close": np.linspace(100.0, 101.0, len(idx))}, index=idx)
+    y = pd.Series(-0.01, index=idx)
+    ensemble = EnsembleModel(
+        target_column="close",
+        horizon=1,
+        config=EnsembleConfig(models=[], weighting_strategy="dynamic"),
+    )
+    ensemble.models = {"a": object(), "b": object()}  # type: ignore[assignment]
+    ensemble.weights = {"a": 0.5, "b": 0.5}
+    ensemble.is_fitted = True
+
+    monkeypatch.setattr(
+        ensemble,
+        "_compute_oof_positions",
+        lambda *_args, **_kwargs: {
+            "a": pd.Series(1.0, index=idx),
+            "b": pd.Series(1.0, index=idx),
+        },
+    )
+
+    assert ensemble._fit_meta_learner_weights(X, y, ["a", "b"], {})
+    assert sum(ensemble.weights.values()) <= 1.0 + 1e-12
+    assert sum(ensemble.weights.values()) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_score_does_not_renormalize_subunit_weights(monkeypatch):
+    idx = pd.bdate_range("2026-01-01", periods=4)
+    X = pd.DataFrame({"close": [100.0, 101.0, 102.0, 103.0]}, index=idx)
+    ensemble = EnsembleModel(
+        target_column="close",
+        horizon=1,
+        config=EnsembleConfig(models=[], weighting_strategy="static"),
+    )
+    ensemble.models = {"a": object(), "b": object()}  # type: ignore[assignment]
+    ensemble.weights = {"a": 0.2, "b": 0.3}
+    ensemble.is_fitted = True
+    monkeypatch.setattr(
+        ensemble,
+        "_predict_positions_per_model",
+        lambda *_args, **_kwargs: {
+            "a": np.ones(len(X)),
+            "b": np.ones(len(X)),
+        },
+    )
+
+    np.testing.assert_allclose(ensemble.score(X), np.full(len(X), 0.5))
+    np.testing.assert_allclose(ensemble.predict(X), np.ones(len(X)))
+
+
 # --------------------------------------------------------------------------
 # Bug 5: calculate_signal's inter-model-agreement boost must receive the real
 # features window. It used to pass an empty pd.DataFrame(index=[date]), which
@@ -327,8 +383,9 @@ def test_calculate_signal_uses_features_for_agreement_boost(caplog):
     fe.fit_scalers(train_raw, "SYM")
     train_scaled = fe.transform_features(train_raw, "SYM", is_train=True)
     test_scaled = fe.transform_features(test_raw, "SYM", is_train=False)
-    drop = [c for c in train_scaled.columns if "target_" in c or "direction_" in c]
+    drop = [c for c in train_scaled.columns if is_label_column(c)]
     X_train = train_scaled.drop(columns=drop)
+    assert not any(is_label_column(c) for c in X_train.columns)
     y_train = train_scaled[target_col]
     feat = test_scaled.drop(columns=drop).reindex(columns=X_train.columns, fill_value=0)
 

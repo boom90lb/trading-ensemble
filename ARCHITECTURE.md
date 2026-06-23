@@ -106,6 +106,19 @@ close/open matrix ──► rolling formation/test folds ──► train-only pa
 - `walk_forward.py`: rolls formation/test windows, freezes selected pairs per
   fold, forces fold-end targets flat, records pair turnover and fold metrics,
   and reports `pair_set_dsr` from selected pair-book trial Sharpes.
+- `factors.py` (residual mode): causal eligibility (history/price/dollar-volume
+  floors), weekly standardized-return PCA eigenportfolios (`Q = v/sigma`,
+  sign-fixed), and per-day batched OLS of stock returns on factor returns.
+- `residual.py`: AR(1)/OU fits on cumulative residuals, drift-adjusted A-L
+  s-scores (invalid/slow fits are counted, never traded), the threshold state
+  machine, and per-symbol netting of stock + eigenportfolio hedge legs into
+  close-time targets.
+- `residual_walk_forward.py`: same fold geometry and flattening as pairs, but
+  estimators re-roll causally through test bars (nothing is frozen per fold);
+  reports per-fold names traded, gross, cost share, and invalid-OU rates.
+  The residual overfit control is the cross-run trial ledger
+  (`results/stat_arb_residual_trials.jsonl`, written by the CLI), which feeds
+  `residual_set_dsr`.
 - This is the market-neutral research path. It does not use the single-symbol
   ensemble, because independent ticker forecasts are not an arbitrage book.
 
@@ -117,8 +130,8 @@ close/open matrix ──► rolling formation/test folds ──► train-only pa
 | `backtest.py` | default shared-capital target-weight WFO; optional legacy order-mode baselines + PBO/DSR | root `claim_packet.json`, target/fill/cost/equity CSVs, `summary.json` |
 | `sweep.py` | ensemble-layer grid → honest DSR (forecast-only) | `trial_sharpes.json`, `selected_config.json` |
 | `rl_seed_eval.py` | multi-seed RL overfitting study | `rl_seed_eval.json` |
-| `stat_arb.py` | train-only cointegration scan → market-neutral pair portfolio | `pairs.json`, `summary.json`, weights/costs CSVs |
 | `stat_arb_wfo.py` | rolling formation/test stat-arb WFO with fold-selection ledgers | `folds.json`, `pairs.json`, `summary.json`, weights/costs CSVs |
+| `stat_arb_residual_wfo.py` | residual (Avellaneda-Lee) WFO over a universe file + cross-run trial ledger | `folds.json`, `summary.json`, `config.json`, weights/costs CSVs, `stat_arb_residual_trials.jsonl` |
 | `prediction.py` | point predictions from a saved model | CSV + plot |
 
 `config.py` is the single source of truth (weights, hyperparams, dirs, dataclass

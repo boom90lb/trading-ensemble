@@ -47,10 +47,9 @@ from scripts.sweep import combine_symbol_returns
 from scripts.training import build_features, reject_sentiment_flag, select_rl_features
 from src.config import EnsembleConfig, ModelConfig
 from src.data_loader import DataLoader
-from src.features import FeatureEngineer
+from src.features import FeatureEngineer, forward_return_column, is_label_column
 from src.models.ensemble import EnsembleModel
 from src.models.registry import POLICY_MODELS
-from src.sentiment_analysis import SentimentAnalyzer
 from src.tracking.mlflow_utils import init_mlflow, log_metrics_safe, log_params_safe
 from src.validation.metrics import (
     deflated_sharpe_ratio,
@@ -171,7 +170,7 @@ def make_seeded_fold_model_factory(
         )
         X_train = train_scaled.drop(
             columns=[c for c in train_scaled.columns
-                     if "target_" in c or "direction_" in c]
+                     if is_label_column(c)]
         )
         y_train = train_scaled[target_col]
 
@@ -217,7 +216,7 @@ def eval_member_seed(
     horizon: int,
     feature_engineer: FeatureEngineer,
     args,
-    sentiment_analyzer: Optional[SentimentAnalyzer],
+    sentiment_analyzer: Optional[Any],
     use_sentiment: bool,
     symbol_to_dividends: Dict[str, Optional[pd.Series]],
 ) -> pd.Series:
@@ -328,11 +327,11 @@ def main():
         raise ValueError("No symbols to evaluate after filtering.")
 
     horizon = training_config["prediction_horizon"]
-    target_col = f"target_{horizon}"
-    # Sentiment join mirrors the training run; keyword analyzer is the wired one.
+    target_col = forward_return_column(horizon)
     use_sentiment = bool(training_config.get("use_sentiment", False))
     reject_sentiment_flag(use_sentiment, surface="rl_seed_eval")
-    sentiment_analyzer = SentimentAnalyzer() if use_sentiment else None
+    use_sentiment = False
+    sentiment_analyzer = None
 
     data_loader = DataLoader()
     feature_engineer = FeatureEngineer()

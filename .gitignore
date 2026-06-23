@@ -144,6 +144,9 @@ results/
 logs/
 tensorboard_logs/
 
+# Advisor-local /improve execution plans (uncommitted by design)
+plans/
+
 # Environments
 .env
 .venv

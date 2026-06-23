@@ -18,6 +18,7 @@ from src.execution.costs import daily_borrow_dollars
 from src.execution.target_weights import scale_to_max_gross
 from src.models.base import BaseModel
 from src.models.ensemble import EnsembleModel
+from src.features import is_label_column
 from src.models.mapping import realized_vol
 from src.sentiment_analysis import SentimentAnalyzer
 from src.validation.metrics import calmar_ratio, probabilistic_sharpe_ratio
@@ -554,6 +555,55 @@ class TradingStrategy:
         self.execution_model.drop_pending()
         self._bar_dates = {}
 
+    @staticmethod
+    def _without_label_columns(df: pd.DataFrame) -> pd.DataFrame:
+        label_cols = [c for c in df.columns if is_label_column(c)]
+        return df.drop(columns=label_cols) if label_cols else df
+
+    @staticmethod
+    def _trailing_window_at(
+        df: pd.DataFrame,
+        date: pd.Timestamp,
+        hist: int,
+    ) -> Optional[Tuple[pd.DataFrame, int]]:
+        try:
+            loc = df.index.get_loc(date)
+        except KeyError:
+            return None
+
+        if isinstance(loc, slice):
+            stop = loc.stop if loc.stop is not None else len(df)
+        elif isinstance(loc, np.ndarray):
+            matches = np.flatnonzero(loc) if loc.dtype == bool else np.asarray(loc, dtype=int)
+            if len(matches) == 0:
+                return None
+            stop = int(matches[-1]) + 1
+        else:
+            stop = int(loc) + 1
+
+        hist = max(1, int(hist))
+        start = max(0, stop - hist)
+        return df.iloc[start:stop], stop - 1
+
+    def _prediction_frames(
+        self,
+        data: Dict[str, pd.DataFrame],
+        model_data: Optional[Dict[str, pd.DataFrame]],
+    ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+        model_sources: Dict[str, pd.DataFrame] = {}
+        model_frames: Dict[str, pd.DataFrame] = {}
+        policy_frames: Dict[str, pd.DataFrame] = {}
+        for symbol, symbol_data in data.items():
+            symbol_model_data = (
+                model_data.get(symbol, symbol_data)
+                if model_data is not None
+                else symbol_data
+            )
+            model_sources[symbol] = symbol_model_data
+            model_frames[symbol] = self._without_label_columns(symbol_model_data)
+            policy_frames[symbol] = self._without_label_columns(symbol_data)
+        return model_sources, model_frames, policy_frames
+
     def generate_target_weight_segment(
         self,
         data: Dict[str, pd.DataFrame],
@@ -608,6 +658,9 @@ class TradingStrategy:
                     logger.error(f"Error creating sentiment features for {symbol}: {e}")
                     sentiment_data[symbol] = pd.DataFrame(index=all_dates)
 
+        hist = getattr(self.model, "required_history", 1)
+        _, model_frames, policy_frames = self._prediction_frames(data, model_data)
+
         rows: List[Dict[str, Union[pd.Timestamp, float]]] = []
         for date in all_dates:
             row: Dict[str, Union[pd.Timestamp, float]] = {"date": date}
@@ -616,34 +669,24 @@ class TradingStrategy:
                     continue
                 price_row = symbol_data.loc[date]
                 price = float(price_row["close"])
-                symbol_model_data = (
-                    model_data.get(symbol, symbol_data)
-                    if model_data is not None
-                    else symbol_data
-                )
-                if date not in symbol_model_data.index:
+                model_window = self._trailing_window_at(model_frames[symbol], date, hist)
+                if model_window is None:
                     logger.warning(
                         "No model-data row for %s on %s; skipping target",
                         symbol,
                         date,
                     )
                     continue
-
-                hist = getattr(self.model, "required_history", 1)
-                features_df = symbol_model_data.loc[:date].iloc[-hist:].copy()
-                policy_features_df = symbol_data.loc[:date].iloc[-hist:].copy()
-                label_cols = [
-                    c for c in features_df.columns
-                    if "target_" in c or "direction_" in c
-                ]
-                if label_cols:
-                    features_df = features_df.drop(columns=label_cols)
-                policy_label_cols = [
-                    c for c in policy_features_df.columns
-                    if "target_" in c or "direction_" in c
-                ]
-                if policy_label_cols:
-                    policy_features_df = policy_features_df.drop(columns=policy_label_cols)
+                policy_window = self._trailing_window_at(policy_frames[symbol], date, hist)
+                if policy_window is None:
+                    logger.warning(
+                        "No policy-data row for %s on %s; skipping target",
+                        symbol,
+                        date,
+                    )
+                    continue
+                features_df, _ = model_window
+                policy_features_df, _ = policy_window
 
                 symbol_sentiment = None
                 if use_sentiment and symbol in sentiment_data:
@@ -754,6 +797,8 @@ class TradingStrategy:
         # (realize_pos, lower, upper, anchor_close, sigma_anchor) where
         # realize_pos is the symbol's own integer index position at t+h.
         conformal_pending: Dict[str, deque] = defaultdict(deque)
+        hist = getattr(self.model, "required_history", 1)
+        model_sources, model_frames, policy_frames = self._prediction_frames(data, model_data)
 
         for offset, date in enumerate(all_dates):
             bar_idx = start_bar_idx + offset
@@ -787,52 +832,37 @@ class TradingStrategy:
 
             # 4. Generate signals + queue orders for bar_idx+1.
             for symbol, price in current_prices.items():
-                symbol_data = data[symbol]
-                symbol_model_data = (
-                    model_data.get(symbol, symbol_data)
-                    if model_data is not None
-                    else symbol_data
-                )
-                if date not in symbol_model_data.index:
+                symbol_model_data = model_sources[symbol]
+                model_window = self._trailing_window_at(model_frames[symbol], date, hist)
+                if model_window is None:
                     logger.warning(
                         "No model-data row for %s on %s; skipping signal",
                         symbol,
                         date,
                     )
                     continue
+                policy_window = self._trailing_window_at(policy_frames[symbol], date, hist)
+                if policy_window is None:
+                    logger.warning(
+                        "No policy-data row for %s on %s; skipping signal",
+                        symbol,
+                        date,
+                    )
+                    continue
                 # Feed the model enough trailing history to score this bar.
-                # Point models need 1 row; windowed/sequence members (LSTM, RL
+                # Point models need 1 row; windowed/sequence members (RL
                 # agents) need their lookback or predict() errors out and the
                 # member contributes no signal. predict() returns one position
-                # per fed row → the LAST element is this bar's decision.
-                hist = getattr(self.model, "required_history", 1)
-                features_df = symbol_model_data.loc[:date].iloc[-hist:].copy()
-                policy_features_df = symbol_data.loc[:date].iloc[-hist:].copy()
-                # Match the column set the members were FIT on: training drops
-                # target_/direction_ label columns before ensemble.fit, and
-                # XGBoost validates feature names strictly, so they must be
-                # excluded here too (else every per-bar predict raises a
-                # feature_names mismatch and the member contributes nothing).
-                _label_cols = [
-                    c for c in features_df.columns
-                    if "target_" in c or "direction_" in c
-                ]
-                if _label_cols:
-                    features_df = features_df.drop(columns=_label_cols)
-                policy_label_cols = [
-                    c for c in policy_features_df.columns
-                    if "target_" in c or "direction_" in c
-                ]
-                if policy_label_cols:
-                    policy_features_df = policy_features_df.drop(columns=policy_label_cols)
+                # per fed row -> the LAST element is this bar's decision.
+                features_df, cur_pos = model_window
+                policy_features_df, _ = policy_window
 
                 conformal_on = (
                     isinstance(self.model, EnsembleModel) and self.model.has_conformal()
                 )
-                cur_pos = symbol_model_data.index.get_loc(date) if conformal_on else 0
                 model_price = price
                 if self.model.target_column in symbol_model_data.columns:
-                    model_price = float(symbol_model_data.loc[date, self.model.target_column])
+                    model_price = float(symbol_model_data[self.model.target_column].iloc[cur_pos])
 
                 # Phase 2.5: realize matured conformal bands → ACI online
                 # update. A band queued at t is scored at t+h against the
@@ -874,12 +904,13 @@ class TradingStrategy:
                         lower, point, upper = self.model.predict_band(
                             features_df,
                             policy_X=policy_features_df,
+                            point=predictions,
                         )
                         if len(lower) > 0 and len(upper) > 0:
                             band_width = float(upper[-1] - lower[-1])
                             sigma_now = float(
                                 realized_vol(
-                                    symbol_model_data[self.model.target_column].loc[:date],
+                                    symbol_model_data[self.model.target_column].iloc[: cur_pos + 1],
                                     window=self.model.vol_window,
                                     vol_floor=self.model.vol_floor,
                                 )[-1]

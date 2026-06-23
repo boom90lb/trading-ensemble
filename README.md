@@ -68,6 +68,8 @@ default, `--order_type MOC` for market-on-close). Nothing fills same-bar.
 Costs applied in both paths:
 
 - half-spread (`--spread_bps`) + linear notional impact (`--slippage_coeff`),
+- optional ADV participation impact (`--adv_impact_coeff`,
+  `--adv_floor_dollars`) when dollar-volume panels are available,
 - commission in bps (`--commission_bps`),
 - daily **borrow** on open short notional (`--borrow_bps_annual`) — shorts are
   not free.
@@ -189,9 +191,9 @@ POLYGON_API_KEY=...
 python -m scripts.training --symbols AAPL,MSFT,GOOG --start_date 2018-01-01 \
     --horizon 5 --n_splits 5
 
-# Universe file + as-of point-in-time inclusion guard; with sentiment.
+# Universe file + as-of point-in-time inclusion guard.
 python -m scripts.training --universe data/universe/2026-05-30.txt \
-    --universe_asof 2018-01-01 --use_sentiment
+    --universe_asof 2018-01-01
 
 # RL members at a real training budget (the default 100k is heavy).
 python -m scripts.training --symbols AAPL --models xgboost,lstm_ppo \
@@ -233,9 +235,6 @@ python -m scripts.rl_seed_eval --training_run runs/{run_name} \
 python -m scripts.stat_arb_wfo --symbols AAPL,MSFT,GOOG,AMZN,META,NVDA \
     --start_date 2020-01-01 --formation_bars 504 --test_bars 63 --max_pairs 5
 
-# Single formation/test smoke test.
-python -m scripts.stat_arb --symbols AAPL,MSFT,GOOG,AMZN,META,NVDA \
-    --start_date 2020-01-01 --formation_bars 504 --max_pairs 5
 ```
 
 This is the only path in the repo that should currently be called
@@ -322,7 +321,7 @@ src/
   sentiment_analysis.py keyword + FinBERT analyzers, PIT bucketing
   trading.py           target generation, signals, legacy position accounting
   logging_utils.py     configure_logging + per-symbol adapter (Phase 5.1)
-  models/              arima, prophet, lstm, xgboost, {lstm,xlstm}_ppo, xlstm_grpo,
+  models/              arima, prophet, xgboost, {lstm,xlstm}_ppo, xlstm_grpo,
                        ensemble, registry (forecast vs policy), mapping (vol-sizing)
   baselines/           buy-and-hold, MA-crossover, TSMOM
   execution/           target-weight accounting, ExecutionModel + cost functions
@@ -337,7 +336,6 @@ scripts/
   backtest.py          target-weight WFO, legacy order WFO + baselines/PBO
   sweep.py             ensemble-layer grid → DSR
   rl_seed_eval.py      multi-seed RL overfitting study
-  stat_arb.py          train-only pairs stat-arb backtest
   stat_arb_wfo.py      rolling formation/test pairs stat-arb WFO
   prediction.py        point predictions from a saved model
 tests/                 ~234 offline tests (validation, leakage, execution, conformal, logging)
@@ -353,7 +351,6 @@ tests/                 ~234 offline tests (validation, leakage, execution, confo
   `__post_init__` (e.g. `n_splits >= 2`, `0 <= embargo_pct < 1`,
   `0 < position_size <= 1`, `borrow_rate_bps_annual >= 0`). Invalid CLI
   arguments fail fast at config construction.
-- `resolve_jax_device()` maps `"auto"` to gpu/tpu/cpu from `jax.devices()`.
 
 ---
 

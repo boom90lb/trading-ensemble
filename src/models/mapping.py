@@ -1,9 +1,9 @@
 """Map forecast outputs to position sizes via inverse-volatility scaling.
 
-A forecast model emits ŷ_{t+h} (predicted price); the trading layer needs a
-position ∈ [-1, 1]. The standard quant-finance bridge is to size the bet by
-the forecast's expected return divided by recent realized volatility, then
-clip. This makes ensemble members commensurable with policy-model positions.
+Forecast members emit expected h-bar returns; the trading layer needs a
+position in [-1, 1]. The standard quant-finance bridge is to size the bet by
+expected return divided by recent realized volatility, then clip. This makes
+ensemble members commensurable with policy-model positions.
 """
 
 from __future__ import annotations
@@ -47,6 +47,28 @@ def forecast_to_position(
         raise ValueError(f"shape mismatch: sigma {sigma.shape} vs current {current_price.shape}")
 
     expected_return = (forecast_price - current_price) / current_price
+    return return_forecast_to_position(
+        expected_return,
+        sigma,
+        target_vol=target_vol,
+        cap=cap,
+    )
+
+
+def return_forecast_to_position(
+    forecast_return: np.ndarray,
+    sigma: np.ndarray,
+    target_vol: float = 1.0,
+    cap: float = 1.0,
+) -> np.ndarray:
+    """Convert forecast returns to positions sized by inverse realized vol."""
+    forecast_return = np.asarray(forecast_return, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+
+    if sigma.shape != forecast_return.shape:
+        raise ValueError(f"shape mismatch: forecast {forecast_return.shape} vs sigma {sigma.shape}")
+
+    expected_return = forecast_return
     raw_position = target_vol * expected_return / sigma
     return np.clip(raw_position, -cap, cap)
 

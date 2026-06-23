@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt  # type: ignore
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
 
-from scripts.training import parse_model_names, reject_sentiment_flag
+from scripts.training import parse_model_names
 from src.config import MODELS_DIR, RESULTS_DIR
 from src.data_loader import DataLoader
 from src.features import FeatureEngineer
@@ -35,8 +35,6 @@ def parse_args():
     parser.add_argument("--horizon", type=int, default=5, help="Forecast horizon")
 
     parser.add_argument("--model_path", type=str, default=None, help="Path to the saved model (default: latest model)")
-
-    parser.add_argument("--use_sentiment", action="store_true", help="Use sentiment analysis")
 
     parser.add_argument("--days", type=int, default=30, help="Number of days of historical data to use")
 
@@ -117,7 +115,7 @@ def load_model(path=None, horizon=5):
     return model
 
 
-def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, days, plot):
+def make_predictions(symbols, timeframe, horizon, model_path, days, plot):
     """Make predictions for the given symbols.
 
     Args:
@@ -125,7 +123,6 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
         timeframe: Time interval
         horizon: Forecast horizon
         model_path: Path to the saved model
-        use_sentiment: Whether to use sentiment analysis
         days: Number of days of historical data to use
         plot: Whether to plot predictions
     """
@@ -137,9 +134,6 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
 
     # Initialize feature engineer
     feature_engineer = FeatureEngineer()
-
-    reject_sentiment_flag(use_sentiment, surface="prediction")
-    sentiment_analyzer = None
 
     # Set date range
     end_date = datetime.now().strftime("%Y-%m-%d")
@@ -163,16 +157,6 @@ def make_predictions(symbols, timeframe, horizon, model_path, use_sentiment, day
         # Create features
         df_with_features = feature_engineer.create_features(df)
         df_with_features = feature_engineer.create_lagged_features(df_with_features, [1, 2, 5, 10])
-
-        # Add sentiment features if requested
-        if use_sentiment and sentiment_analyzer:
-            logger.info(f"Creating sentiment features for {symbol}")
-            sentiment_features = sentiment_analyzer.create_sentiment_features(
-                symbol, pd.DatetimeIndex(df_with_features.index)  # type: ignore
-            )
-
-            if not sentiment_features.empty:
-                df_with_features = df_with_features.join(sentiment_features)
 
         # Prepare input features
         X = df_with_features.copy()
@@ -294,7 +278,6 @@ def main():
         timeframe=args.timeframe,
         horizon=args.horizon,
         model_path=args.model_path,
-        use_sentiment=args.use_sentiment,
         days=args.days,
         plot=args.plot,
     )

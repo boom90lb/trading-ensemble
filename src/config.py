@@ -29,35 +29,6 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", f"file://{MLRUNS_DIR}")
 
 
-def resolve_jax_device(preference: str = "auto") -> str:
-    """Resolve a JAX device preference to a concrete backend name.
-
-    "auto" picks gpu/tpu when available, otherwise cpu. Explicit values pass through.
-    """
-    if preference != "auto":
-        return preference
-    try:
-        import jax
-
-        backends = {d.platform.lower() for d in jax.devices()}
-        if backends & {"gpu", "cuda", "rocm"}:
-            return "gpu"
-        if "tpu" in backends:
-            return "tpu"
-        return "cpu"
-    except Exception:
-        return "cpu"
-
-
-# JAX configuration
-JAX_CONFIG = {
-    "jit": True,
-    "device": "auto",  # resolved via resolve_jax_device() at use sites
-    "precision": "float32",
-    "memory_fraction": 0.8,
-}
-
-
 @dataclass
 class ModelConfig:
     """Configuration for an individual model in the ensemble."""
@@ -65,8 +36,6 @@ class ModelConfig:
     name: str
     enabled: bool = True
     weight: float = 1.0
-    params: Optional[dict] = None
-    jax_config: Optional[dict] = None
 
 
 @dataclass
@@ -74,9 +43,7 @@ class EnsembleConfig:
     """Configuration for the ensemble model."""
 
     models: List[ModelConfig]
-    weighting_strategy: str = "static"  # "static", "dynamic", "adaptive"
-    refit_interval: int = 0
-    optimize_weights: bool = False
+    weighting_strategy: str = "static"  # "static" or "dynamic"
     # Vol-targeting knobs for the forecast→position mapping. Exposed here
     # (Phase 2.7) so a hyperparameter sweep can vary them as first-class,
     # persisted config rather than poking post-construction attrs.
@@ -106,7 +73,6 @@ class TrainingConfig:
     end_date: Optional[str] = None
     prediction_horizon: int = 5
     use_sentiment: bool = False
-    optimize: bool = False
     # Outer-WFO knobs. purge_horizon=None -> use prediction_horizon.
     n_splits: int = 5
     purge_horizon: Optional[int] = None
@@ -156,6 +122,17 @@ class ExecutionConfig:
     default_order_type: str = "MOO"
     # Trading days per year used for borrow accrual.
     trading_days_per_year: int = 252
+    # Capacity-aware impact (opt-in). When adv_impact_coeff > 0 AND a dollar_volume
+    # panel is supplied to backtest_target_weights, add impact in bps =
+    #   adv_impact_coeff * participation
+    # or, for adv_impact_model="sqrt":
+    #   adv_impact_coeff * sqrt(participation)
+    # where participation = |trade_dollars_i| / max(adv_dollars_i, adv_floor_dollars)
+    # per name, on top of the portfolio-relative slippage_coeff term. Default 0 ->
+    # exact current behavior.
+    adv_impact_coeff: float = 0.0
+    adv_impact_model: str = "linear"
+    adv_floor_dollars: float = 1.0e5
 
     def __post_init__(self):
         assert self.spread_bps >= 0, f"spread_bps must be >= 0; got {self.spread_bps}"
@@ -173,6 +150,16 @@ class ExecutionConfig:
         )
         assert self.trading_days_per_year > 0, (
             f"trading_days_per_year must be > 0; got {self.trading_days_per_year}"
+        )
+        assert self.adv_impact_coeff >= 0, (
+            f"adv_impact_coeff must be >= 0; got {self.adv_impact_coeff}"
+        )
+        assert self.adv_impact_model in ("linear", "sqrt"), (
+            "adv_impact_model must be 'linear' or 'sqrt'; "
+            f"got {self.adv_impact_model!r}"
+        )
+        assert self.adv_floor_dollars > 0, (
+            f"adv_floor_dollars must be > 0; got {self.adv_floor_dollars}"
         )
 
 
@@ -246,8 +233,6 @@ DEFAULT_MODELS = [
 DEFAULT_ENSEMBLE_CONFIG = EnsembleConfig(
     models=DEFAULT_MODELS,
     weighting_strategy="dynamic",
-    refit_interval=0,
-    optimize_weights=False,
 )
 
 DEFAULT_TRADING_CONFIG = TradingConfig(
@@ -265,5 +250,4 @@ DEFAULT_TRAINING_CONFIG = TrainingConfig(
     end_date=None,
     prediction_horizon=5,
     use_sentiment=False,
-    optimize=False,
 )

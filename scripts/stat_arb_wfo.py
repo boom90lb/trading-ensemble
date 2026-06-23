@@ -9,10 +9,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.stat_arb import _fetch_matrices
-from src.arbitrage import (
+from scripts.stat_arb_data import fetch_price_matrices as _fetch_matrices
+from src.arbitrage.pairs import (
     PairSelectionConfig,
     PairSignalConfig,
+)
+from src.arbitrage.walk_forward import (
     StatArbWalkForwardConfig,
     fold_result_to_dict,
     run_stat_arb_walk_forward,

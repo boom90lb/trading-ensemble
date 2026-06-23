@@ -17,6 +17,8 @@ import numpy as np
 import pandas as pd
 from statsmodels.tsa.stattools import adfuller, coint  # type: ignore
 
+from src.arbitrage.factors import batched_factor_ols, compute_returns, estimate_eigenportfolios
+
 
 _EPS = 1e-12
 
@@ -41,6 +43,8 @@ class PairSelectionConfig:
     min_abs_beta: float = 0.05
     max_pairs: int = 10
     autolag: str = "aic"
+    candidate_prior: Literal["none", "corr"] = "none"
+    prior_min_abs_corr: float = 0.5
     construction_mode: Literal["fdr_hard", "shrunk_candidates"] = "fdr_hard"
 
     def __post_init__(self) -> None:
@@ -62,6 +66,10 @@ class PairSelectionConfig:
             raise ValueError(f"min_abs_beta must be >= 0, got {self.min_abs_beta}")
         if self.max_pairs < 1:
             raise ValueError(f"max_pairs must be >= 1, got {self.max_pairs}")
+        if self.candidate_prior not in ("none", "corr"):
+            raise ValueError(f"candidate_prior must be 'none' or 'corr', got {self.candidate_prior!r}")
+        if not 0.0 <= self.prior_min_abs_corr <= 1.0:
+            raise ValueError(f"prior_min_abs_corr must be in [0, 1], got {self.prior_min_abs_corr}")
         if self.construction_mode not in ("fdr_hard", "shrunk_candidates"):
             raise ValueError(
                 "construction_mode must be 'fdr_hard' or 'shrunk_candidates', "
@@ -140,6 +148,7 @@ class PairSelectionReport:
     rejection_counts: dict[str, int]
     raw_candidates: tuple[PairCandidate, ...]
     selected_candidates: tuple[PairCandidate, ...]
+    n_prior_admitted: int = 0
 
 
 def benjamini_hochberg_mask(pvalues: Iterable[float], alpha: float) -> np.ndarray:
@@ -339,6 +348,27 @@ def _known_rejection_counts(counter: Counter[str]) -> dict[str, int]:
     return {reason: int(counter.get(reason, 0)) for reason in reasons}
 
 
+def _prior_admitted_pairs(
+    symbols: list[str], log_prices: pd.DataFrame, config: PairSelectionConfig
+) -> list[tuple[str, str]]:
+    """Symbol pairs to test, after the candidate_prior screen.
+
+    ``candidate_prior="none"`` returns the full family. ``"corr"`` keeps only
+    pairs whose ex-ante formation return correlation clears ``prior_min_abs_corr``
+    -- a cheap O(N^2) matrix op replacing an O(N^2) cointegration scan, and an
+    *economic* admission narrowing rather than a backtest-driven one. On
+    factor-residual prices most market co-movement is already removed, so the
+    screen keeps only genuinely related idiosyncratic pairs.
+    """
+    all_pairs = list(combinations(symbols, 2))
+    if config.candidate_prior == "none" or len(symbols) < 2:
+        return all_pairs
+    corr = np.abs(log_prices[symbols].diff().corr().to_numpy(dtype=float))
+    idx = {s: i for i, s in enumerate(symbols)}
+    thr = config.prior_min_abs_corr
+    return [(y, x) for y, x in all_pairs if np.isfinite(corr[idx[y], idx[x]]) and corr[idx[y], idx[x]] >= thr]
+
+
 def scan_cointegrated_pairs_with_report(
     close_prices: pd.DataFrame, config: Optional[PairSelectionConfig] = None
 ) -> PairSelectionReport:
@@ -347,9 +377,14 @@ def scan_cointegrated_pairs_with_report(
     log_prices = _log_prices(close_prices)
     symbols = [c for c in log_prices.columns if log_prices[c].notna().sum() >= config.min_obs]
     n_symbol_pairs = len(symbols) * (len(symbols) - 1) // 2
+    # candidate_prior prunes the O(N^2) family to economically-related pairs
+    # before the expensive cointegration tests; the full family size is still
+    # recorded (n_symbol_pairs) for honest multiplicity.
+    pair_list = _prior_admitted_pairs(symbols, log_prices, config)
+    n_prior_admitted = len(pair_list)
     rejected: Counter[str] = Counter()
     raw: list[PairCandidate] = []
-    for asset_y, asset_x in combinations(symbols, 2):
+    for asset_y, asset_x in pair_list:
         candidates = [
             c
             for c in (
@@ -373,12 +408,12 @@ def scan_cointegrated_pairs_with_report(
             rejection_counts=_known_rejection_counts(rejected),
             raw_candidates=(),
             selected_candidates=(),
+            n_prior_admitted=n_prior_admitted,
         )
 
     fdr_mask = benjamini_hochberg_mask((c.coint_pvalue for c in raw), config.fdr_alpha)
     accepted_pvalues = [c.coint_pvalue for keep, c in zip(fdr_mask, raw) if keep]
     fdr_cutoff = float(max(accepted_pvalues)) if accepted_pvalues else None
-
     if config.construction_mode == "fdr_hard":
         filtered: list[PairCandidate] = []
         for keep, candidate in zip(fdr_mask, raw):
@@ -412,6 +447,7 @@ def scan_cointegrated_pairs_with_report(
         rejection_counts=_known_rejection_counts(rejected),
         raw_candidates=tuple(raw),
         selected_candidates=tuple(selected),
+        n_prior_admitted=n_prior_admitted,
     )
 
 
@@ -425,6 +461,76 @@ def scan_cointegrated_pairs(
     """
     report = scan_cointegrated_pairs_with_report(close_prices, config)
     return list(report.selected_candidates)
+
+
+def residualize_cross_sectional(close_prices: pd.DataFrame) -> pd.DataFrame:
+    """Causal equal-weight-market residual 'prices' for pairs-on-residuals.
+
+    Each bar's cross-sectional mean log-return (the equal-weight market factor) is
+    removed from every name, and the residual returns are re-accumulated into a
+    positive price level so the log-price/cointegration machinery applies
+    unchanged. Residualizing first means the downstream correlation/cointegration
+    screen captures *idiosyncratic* co-movement rather than shared market beta
+    (audit S-4: EG cointegration on raw megacaps mostly reflects factor loadings).
+
+    This is the cheapest neutralization -- one causal factor, no estimation window
+    (each bar uses only that bar's cross-section). A PCA / sector-ETF
+    residualization (``factors.py``) is the richer, multi-factor variant. Output is
+    NaN wherever the input price is missing, mirroring raw-price availability so
+    per-pair ``dropna`` behaves identically.
+    """
+    log_prices = _log_prices(close_prices)
+    returns = log_prices.diff()
+    market = returns.mean(axis=1)  # equal-weight cross-sectional factor return
+    residual = returns.sub(market, axis=0)
+    residual_price = np.exp(residual.fillna(0.0).cumsum())
+    return residual_price.where(log_prices.notna())
+
+
+def residualize_pca(
+    close_prices: pd.DataFrame,
+    n_factors: int = 15,
+    corr_window: int = 252,
+    rebalance_every: int = 5,
+) -> pd.DataFrame:
+    """Causal multi-factor (Avellaneda-Lee PCA) residual 'prices' for pairs-on-residuals.
+
+    At each rebalance bar, eigenportfolios are re-estimated on the trailing
+    ``corr_window`` of eligible (fully-finite-window) names and frozen until the
+    next rebalance; each bar's residual return is the OLS residual of that name's
+    return on the current factor returns -- the *last* row of the windowed fit, so
+    bar ``t`` uses bars <= t only. Residual returns are re-accumulated into a
+    positive price level. Unlike ``residualize_cross_sectional`` (one equal-weight
+    market factor), this removes the top-``n_factors`` systematic factors (sector +
+    market), so a downstream correlation/cointegration screen on the output captures
+    genuinely idiosyncratic co-movement (audit S-4: EG cointegration on raw names
+    mostly reflects shared factor loadings). Output is NaN before a name has a factor
+    model (warmup / ineligibility) and wherever the input price is missing.
+    """
+    log_prices = _log_prices(close_prices)
+    returns = compute_returns(close_prices)
+    R = returns.to_numpy(dtype=float)
+    n_days, n_assets = R.shape
+    resid_returns = np.full((n_days, n_assets), np.nan)
+    q_full: np.ndarray | None = None
+    for t in range(corr_window, n_days):
+        window = R[t - corr_window + 1 : t + 1]
+        finite = np.isfinite(window).all(axis=0)
+        if (t - corr_window) % rebalance_every == 0 and int(finite.sum()) >= n_factors + 2:
+            q_sub, _ = estimate_eigenportfolios(window[:, finite], n_factors)
+            q_full = np.zeros((n_factors, n_assets))
+            q_full[:, finite] = q_sub
+        if q_full is None or int(finite.sum()) < n_factors + 2:
+            continue
+        # Factor returns use the frozen eigenportfolios (zeros outside the rebalance
+        # cross-section); the OLS regresses the currently-finite names on them and the
+        # bar's residual is the last row (bars <= t only -> causal).
+        factor_window = np.nan_to_num(window, nan=0.0) @ q_full.T
+        _, _, resid = batched_factor_ols(window[:, finite], factor_window)
+        resid_returns[t, np.flatnonzero(finite)] = resid[-1]
+    resid_df = pd.DataFrame(resid_returns, index=returns.index, columns=returns.columns)
+    residual_price = np.exp(resid_df.fillna(0.0).cumsum())
+    return residual_price.where(resid_df.notna() & log_prices.notna())
 
 
 def generate_pair_positions(

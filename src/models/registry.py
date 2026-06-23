@@ -2,12 +2,12 @@
 
 Splits ensemble members by what their `predict` actually returns so the
 ensemble can stop averaging dimensionally incoherent outputs (B8). Forecast
-models emit ŷ (price at t+h); policy models emit position ∈ [-1, 1].
+models emit expected h-bar returns; policy models emit position ∈ [-1, 1].
 """
 
 from typing import Literal
 
-FORECAST_MODELS: frozenset[str] = frozenset({"arima", "prophet", "lstm", "xgboost"})
+FORECAST_MODELS: frozenset[str] = frozenset({"arima", "prophet", "xgboost"})
 POLICY_MODELS: frozenset[str] = frozenset({"lstm_ppo", "xlstm_ppo", "xlstm_grpo"})
 
 ModelKind = Literal["forecast", "policy"]

@@ -12,6 +12,16 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+LABEL_COLUMN_PREFIXES = ("target_", "direction_", "pct_change_")
+
+
+def is_label_column(column: str) -> bool:
+    return column.startswith(LABEL_COLUMN_PREFIXES)
+
+
+def forward_return_column(horizon: int) -> str:
+    return f"pct_change_{horizon}"
+
 
 class ScalerModule(nnx.Module):
     """NNX module for feature scaling."""
@@ -40,19 +50,21 @@ class ScalerModule(nnx.Module):
             return
 
         if self.scaler_type == "standard":
-            self.mean.value = np.nanmean(data, axis=0)
-            self.std.value = np.nanstd(data, axis=0)
+            self.mean.set_value(np.nanmean(data, axis=0))
+            self.std.set_value(np.nanstd(data, axis=0))
             # Avoid division by zero
-            self.std.value = np.where(self.std.value == 0, 1.0, self.std.value)
+            std = self.std.get_value()
+            self.std.set_value(np.where(std == 0, 1.0, std))
         elif self.scaler_type == "minmax":
-            self.min_vals.value = np.nanmin(data, axis=0)
-            self.max_vals.value = np.nanmax(data, axis=0)
+            self.min_vals.set_value(np.nanmin(data, axis=0))
+            self.max_vals.set_value(np.nanmax(data, axis=0))
             # Avoid division by zero
-            range_vals = self.max_vals.value - self.min_vals.value
+            min_vals = self.min_vals.get_value()
+            range_vals = self.max_vals.get_value() - min_vals
             range_vals = np.where(range_vals == 0, 1.0, range_vals)
-            self.max_vals.value = self.min_vals.value + range_vals
+            self.max_vals.set_value(min_vals + range_vals)
 
-        self.is_fitted.value = True
+        self.is_fitted.set_value(True)
 
     def transform(self, data: np.ndarray) -> np.ndarray:
         """Transform the data using the fitted scaler.
@@ -63,15 +75,16 @@ class ScalerModule(nnx.Module):
         Returns:
             Transformed data
         """
-        if self.scaler_type == "none" or not self.is_fitted.value or data.size == 0:
+        if self.scaler_type == "none" or not self.is_fitted.get_value() or data.size == 0:
             return data
 
         result = data.copy()
 
         if self.scaler_type == "standard":
-            result = (result - self.mean.value) / self.std.value
+            result = (result - self.mean.get_value()) / self.std.get_value()
         elif self.scaler_type == "minmax":
-            result = (result - self.min_vals.value) / (self.max_vals.value - self.min_vals.value)
+            min_vals = self.min_vals.get_value()
+            result = (result - min_vals) / (self.max_vals.get_value() - min_vals)
 
         return result
 
@@ -129,9 +142,7 @@ class FeatureEngineer(nnx.Module):
             for col in df.select_dtypes(include=["number"]).columns
             if col not in price_cols
             and col not in volume_cols
-            and not col.startswith("target_")
-            and not col.startswith("direction_")
-            and not col.startswith("pct_change_")
+            and not is_label_column(col)
         ]
         sentiment_cols = [col for col in df.columns if "sentiment" in col.lower()]
         return {
@@ -145,21 +156,21 @@ class FeatureEngineer(nnx.Module):
     def _scaler_state(scaler: ScalerModule) -> Dict[str, Any]:
         return {
             "scaler_type": scaler.scaler_type,
-            "is_fitted": bool(scaler.is_fitted.value),
-            "mean": np.asarray(scaler.mean.value, dtype=float),
-            "std": np.asarray(scaler.std.value, dtype=float),
-            "min_vals": np.asarray(scaler.min_vals.value, dtype=float),
-            "max_vals": np.asarray(scaler.max_vals.value, dtype=float),
+            "is_fitted": bool(scaler.is_fitted.get_value()),
+            "mean": np.asarray(scaler.mean.get_value(), dtype=float),
+            "std": np.asarray(scaler.std.get_value(), dtype=float),
+            "min_vals": np.asarray(scaler.min_vals.get_value(), dtype=float),
+            "max_vals": np.asarray(scaler.max_vals.get_value(), dtype=float),
         }
 
     @staticmethod
     def _scaler_from_state(state: Dict[str, Any]) -> ScalerModule:
         scaler = ScalerModule(scaler_type=str(state["scaler_type"]))
-        scaler.is_fitted.value = bool(state["is_fitted"])
-        scaler.mean.value = np.asarray(state["mean"], dtype=float)
-        scaler.std.value = np.asarray(state["std"], dtype=float)
-        scaler.min_vals.value = np.asarray(state["min_vals"], dtype=float)
-        scaler.max_vals.value = np.asarray(state["max_vals"], dtype=float)
+        scaler.is_fitted.set_value(bool(state["is_fitted"]))
+        scaler.mean.set_value(np.asarray(state["mean"], dtype=float))
+        scaler.std.set_value(np.asarray(state["std"], dtype=float))
+        scaler.min_vals.set_value(np.asarray(state["min_vals"], dtype=float))
+        scaler.max_vals.set_value(np.asarray(state["max_vals"], dtype=float))
         return scaler
 
     def to_plain_state(
@@ -286,12 +297,12 @@ class FeatureEngineer(nnx.Module):
         group_name: str,
         n_columns: int,
     ) -> None:
-        if not bool(scaler.is_fitted.value):
+        if not bool(scaler.is_fitted.get_value()):
             return
         if scaler.scaler_type == "minmax":
-            fitted = int(np.asarray(scaler.min_vals.value).shape[0])
+            fitted = int(np.asarray(scaler.min_vals.get_value()).shape[0])
         elif scaler.scaler_type == "standard":
-            fitted = int(np.asarray(scaler.mean.value).shape[0])
+            fitted = int(np.asarray(scaler.mean.get_value()).shape[0])
         else:
             return
         if fitted != n_columns:
@@ -454,20 +465,22 @@ class FeatureEngineer(nnx.Module):
         result = df.copy()
 
         try:
-            # Get all numeric columns except target columns (which start with "target_")
+            # Get all numeric columns except forward-label columns.
             numeric_cols = [
                 col
                 for col in df.select_dtypes(include=["number"]).columns
-                if not (col.startswith("target_") or col.startswith("direction_"))
+                if not is_label_column(col)
             ]
 
-            # Create lagged features
+            lagged_cols: Dict[str, pd.Series] = {}
             for period in lag_periods:
                 if period <= 0:
                     continue
 
                 for col in numeric_cols:
-                    result[f"{col}_lag{period}"] = result[col].shift(period)
+                    lagged_cols[f"{col}_lag{period}"] = result[col].shift(period)
+            if lagged_cols:
+                result = pd.concat([result, pd.DataFrame(lagged_cols, index=result.index)], axis=1)
 
         except Exception as e:
             logger.error(f"Error creating lagged features: {e}")
@@ -489,13 +502,18 @@ class FeatureEngineer(nnx.Module):
 
         try:
             # Create future price target
-            result[f"target_{horizon}"] = result[price_col].shift(-horizon)
+            target_col = f"target_{horizon}"
+            result[target_col] = result[price_col].shift(-horizon)
 
             # Create direction target (1 for up, -1 for down)
-            result[f"direction_{horizon}"] = np.where(result[f"target_{horizon}"] > result[price_col], 1, -1)
+            result[f"direction_{horizon}"] = np.where(
+                result[target_col].isna(),
+                np.nan,
+                np.where(result[target_col] > result[price_col], 1, -1),
+            )
 
-            # Create percent change target (useful for RL training)
-            result[f"pct_change_{horizon}"] = (result[f"target_{horizon}"] / result[price_col]) - 1
+            # Create the forward return label used by forecast members.
+            result[forward_return_column(horizon)] = (result[target_col] / result[price_col]) - 1
 
         except Exception as e:
             logger.error(f"Error creating target variable: {e}")

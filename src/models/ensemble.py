@@ -1,9 +1,9 @@
 # src/models/ensemble.py
 """Ensemble model. Emits unified position outputs in [-1, 1].
 
-Forecast members (ARIMA, Prophet, LSTM, XGBoost) produce ŷ_{t+h}; policy
-members (LSTM-PPO, xLSTM-PPO, xLSTM-GRPO) produce positions directly.
-Forecast outputs are mapped through inverse-volatility sizing before
+Forecast members (ARIMA, Prophet, LSTM, XGBoost) produce expected h-bar
+returns; policy members (LSTM-PPO, xLSTM-PPO, xLSTM-GRPO) produce positions
+directly. Forecast outputs are mapped through inverse-volatility sizing before
 weighting so the ensemble averages dimensionally coherent quantities (B8).
 """
 
@@ -25,7 +25,7 @@ from src.config import MODELS_DIR, EnsembleConfig
 from src.conformal import ACIState, EnbPICalibrator
 from src.models.base import BaseModel
 from src.models.lstm_ppo import LSTMPPO
-from src.models.mapping import forecast_to_position, ideal_position, realized_vol
+from src.models.mapping import ideal_position, realized_vol, return_forecast_to_position
 from src.models.registry import ModelKind, is_forecast, is_policy, model_kind
 from src.validation.walk_forward import PurgedWalkForward
 
@@ -140,10 +140,6 @@ class EnsembleModel(BaseModel):
                 from src.models.prophet import ProphetModel
 
                 return ProphetModel(target_column=self.target_column, horizon=self.horizon)
-            elif model_name == "lstm":
-                from src.models.lstm import LSTMModel
-
-                return LSTMModel(target_column=self.target_column, horizon=self.horizon)
             elif model_name == "xgboost":
                 from src.models.xgboost_model import XGBoostModel
 
@@ -260,10 +256,12 @@ class EnsembleModel(BaseModel):
             except Exception as e:
                 logger.error(f"Error fitting {name} model: {e}", exc_info=True)
 
+        meta_fit = False
         if self.config.weighting_strategy == "dynamic":
-            self._fit_meta_learner_weights(X_train, y_train, fitted_models, kwargs)
+            meta_fit = self._fit_meta_learner_weights(X_train, y_train, fitted_models, kwargs)
 
-        self._normalize_weights()
+        if not meta_fit:
+            self._normalize_weights()
 
         self.is_fitted = len(fitted_models) > 0
         logger.info(f"Ensemble model fitted with {len(fitted_models)} component models")
@@ -277,7 +275,7 @@ class EnsembleModel(BaseModel):
         y: pd.Series,
         model_names: List[str],
         fit_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         """Replace inverse-MAE-on-train weighting (B5) with a constrained
         meta-learner fit to OOF positions vs. ideal positions.
 
@@ -291,12 +289,12 @@ class EnsembleModel(BaseModel):
                 f"Meta-learner needs '{self.target_column}' in X to compute realized vol; "
                 "skipping dynamic re-weighting."
             )
-            return
+            return False
 
         oof = self._compute_oof_positions(X, y, model_names, fit_kwargs or {})
         if not oof:
             logger.warning("No OOF positions computed; keeping config weights.")
-            return
+            return False
 
         idx = next(iter(oof.values())).index
         members = list(oof.keys())
@@ -304,11 +302,11 @@ class EnsembleModel(BaseModel):
             idx = idx.intersection(oof[name].index)
         if len(idx) < 5:
             logger.warning(f"Only {len(idx)} overlapping OOF rows; keeping config weights.")
-            return
+            return False
 
         close = X.loc[idx, self.target_column]
         sigma = realized_vol(close, window=self.vol_window, vol_floor=self.vol_floor)
-        realized_ret = close.pct_change(self.horizon).shift(-self.horizon).to_numpy()
+        realized_ret = y.loc[idx].to_numpy(dtype=np.float64)
         y_ideal = ideal_position(
             np.nan_to_num(realized_ret, nan=0.0),
             sigma,
@@ -319,7 +317,7 @@ class EnsembleModel(BaseModel):
         valid = np.isfinite(realized_ret)
         if valid.sum() < 5:
             logger.warning("Too few finite realized-return rows for meta-learner; keeping config weights.")
-            return
+            return False
 
         P = np.column_stack([oof[name].loc[idx].to_numpy() for name in members])[valid]
         target = y_ideal[valid]
@@ -330,12 +328,12 @@ class EnsembleModel(BaseModel):
             w0,
             method="SLSQP",
             bounds=[(0.0, 1.0)] * len(members),
-            constraints=[{"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)}],
+            constraints=[{"type": "ineq", "fun": lambda w: float(1.0 - np.sum(w))}],
             options={"ftol": 1e-9, "maxiter": 200},
         )
         if not result.success:
             logger.warning(f"Meta-learner SLSQP did not converge ({result.message}); keeping config weights.")
-            return
+            return False
 
         for name, w in zip(members, result.x):
             self.weights[name] = float(w)
@@ -371,6 +369,7 @@ class EnsembleModel(BaseModel):
             logger.warning(f"Conformal calibration skipped ({e}); predict_band will fall back to max bands.")
             self.conformal = None
             self.aci = None
+        return True
 
     def _compute_oof_positions(
         self,
@@ -406,7 +405,6 @@ class EnsembleModel(BaseModel):
             logger.warning("PurgedWalkForward yielded no folds; skipping OOF.")
             return oof
 
-        close_arr = X[self.target_column].to_numpy()
         sigma_full = realized_vol(
             X[self.target_column],
             window=self.vol_window,
@@ -419,7 +417,7 @@ class EnsembleModel(BaseModel):
             try:
                 if is_forecast(name):
                     oof[name] = self._oof_forecast(
-                        name, X, y, close_arr, sigma_full, folds
+                        name, X, y, sigma_full, folds
                     )
                 elif is_policy(name):
                     oof[name] = self._oof_policy(name, X, y, fit_kwargs, folds)
@@ -434,7 +432,6 @@ class EnsembleModel(BaseModel):
         name: str,
         X: pd.DataFrame,
         y: pd.Series,
-        close_arr: np.ndarray,
         sigma_full: np.ndarray,
         folds: List[tuple],
     ) -> pd.Series:
@@ -447,9 +444,8 @@ class EnsembleModel(BaseModel):
             preds = fold_model.predict(X.iloc[va_idx])
             if len(preds) != len(va_idx):
                 continue
-            out[va_idx] = forecast_to_position(
+            out[va_idx] = return_forecast_to_position(
                 np.asarray(preds, dtype=np.float64),
-                close_arr[va_idx],
                 sigma_full[va_idx],
                 target_vol=self.target_vol,
                 cap=self.position_cap,
@@ -521,10 +517,10 @@ class EnsembleModel(BaseModel):
     ) -> np.ndarray:
         """Return ensemble positions in [-1, 1].
 
-        Forecast members' ŷ are mapped to positions via inverse-volatility
-        sizing against X[target_column]; policy members' outputs pass through
-        with a clip. The weighted blend lives in position space, not the
-        mixed price/position space that produced B8.
+        Forecast members' expected returns are mapped to positions via
+        inverse-volatility sizing against X[target_column]; policy members'
+        outputs pass through with a clip. The weighted blend lives in position
+        space, not the mixed price/position space that produced B8.
         """
         if not self.is_fitted or not self.models:
             logger.warning("Ensemble model not fitted yet")
@@ -552,6 +548,36 @@ class EnsembleModel(BaseModel):
 
         return np.clip(blended, -self.position_cap, self.position_cap)
 
+    def score(
+        self,
+        X: pd.DataFrame,
+        *,
+        policy_X: Optional[pd.DataFrame] = None,
+    ) -> np.ndarray:
+        """Return signed conviction without renormalizing sub-unit weights.
+
+        This is the shared-construct contract. ``predict`` remains the legacy
+        position API and still renormalizes when total positive member weight is
+        not one; ``score`` allows a dynamic meta-learner with ``sum(w) < 1`` to
+        leave cash unallocated.
+        """
+        if not self.is_fitted or not self.models:
+            logger.warning("Ensemble model not fitted yet")
+            return np.array([])
+
+        positions = self._predict_positions_per_model(X, policy_X=policy_X)
+        if not positions:
+            logger.warning("No valid model positions available")
+            return np.array([])
+
+        blended = np.zeros(len(X))
+        for name, pos in positions.items():
+            w = self.weights.get(name, 0.0)
+            if w <= 0:
+                continue
+            blended += w * pos
+        return np.clip(blended, -self.position_cap, self.position_cap)
+
     def has_conformal(self) -> bool:
         """True when fit() produced a usable conformal calibrator + ACI state."""
         return self.conformal is not None and self.conformal.is_fitted and self.aci is not None
@@ -561,14 +587,22 @@ class EnsembleModel(BaseModel):
         X: pd.DataFrame,
         *,
         policy_X: Optional[pd.DataFrame] = None,
+        point: Optional[np.ndarray] = None,
     ) -> tuple:
         """Return ``(lower, point, upper)`` position-space conformal bands.
 
         Falls back to maximally-wide bands (±position_cap) when no conformal
         calibrator was fit — this lets downstream code call predict_band
-        unconditionally and still get a no-op interval.
+        unconditionally and still get a no-op interval. Callers that already
+        computed ``predict`` can pass ``point`` to avoid recomputing member
+        predictions.
         """
-        point = self.predict(X, policy_X=policy_X)
+        if point is None:
+            point = self.predict(X, policy_X=policy_X)
+        else:
+            point = np.asarray(point, dtype=np.float64)
+            if len(point) != len(X):
+                raise ValueError(f"point length {len(point)} does not match X length {len(X)}")
         if not self.has_conformal() or len(point) == 0:
             lower = np.full(len(point), -self.position_cap)
             upper = np.full(len(point), self.position_cap)
@@ -606,7 +640,6 @@ class EnsembleModel(BaseModel):
             raise ValueError(
                 f"policy_X length {len(policy_X)} does not match forecast X length {len(X)}"
             )
-        close = X[self.target_column].to_numpy()
         sigma = realized_vol(X[self.target_column], window=self.vol_window, vol_floor=self.vol_floor)
 
         positions: Dict[str, np.ndarray] = {}
@@ -623,8 +656,8 @@ class EnsembleModel(BaseModel):
                     continue
                 raw_arr = np.asarray(raw, dtype=np.float64)
                 if kind == "forecast":
-                    positions[name] = forecast_to_position(
-                        raw_arr, close, sigma, target_vol=self.target_vol, cap=self.position_cap
+                    positions[name] = return_forecast_to_position(
+                        raw_arr, sigma, target_vol=self.target_vol, cap=self.position_cap
                     )
                 else:
                     positions[name] = np.clip(raw_arr, -self.position_cap, self.position_cap)
@@ -637,8 +670,8 @@ class EnsembleModel(BaseModel):
 
         The ensemble emits positions; the apples-to-apples target is the
         ideal_position derived from realized return / realized vol. Forecast
-        members are scored on price MSE too (the quantity they actually
-        regress against); policy members are scored only in position space.
+        members are scored on return error too (the quantity they regress
+        against); policy members are scored only in position space.
         """
         if not self.is_fitted:
             logger.warning("Ensemble model not fitted yet")
@@ -658,7 +691,7 @@ class EnsembleModel(BaseModel):
             close = X_test[self.target_column].to_numpy()
             sigma = realized_vol(X_test[self.target_column], window=self.vol_window, vol_floor=self.vol_floor)
             y_test_arr = np.asarray(y_test, dtype=np.float64)
-            realized_ret = (y_test_arr - close) / close
+            realized_ret = y_test_arr
             y_ideal = ideal_position(realized_ret, sigma, target_vol=self.target_vol, cap=self.position_cap)
 
             # A forecast member can emit a NaN prediction on real data (e.g.
@@ -693,14 +726,14 @@ class EnsembleModel(BaseModel):
                     if self.kinds.get(name) == "forecast":
                         pf = np.isfinite(y_test_arr) & np.isfinite(model_preds)
                         if pf.sum() >= 2:
-                            metrics[f"{name}_price_mae"] = mean_absolute_error(
+                            metrics[f"{name}_return_mae"] = mean_absolute_error(
                                 y_test_arr[pf], model_preds[pf]
                             )
-                            metrics[f"{name}_price_rmse"] = float(
+                            metrics[f"{name}_return_rmse"] = float(
                                 np.sqrt(mean_squared_error(y_test_arr[pf], model_preds[pf]))
                             )
-                        pos = forecast_to_position(
-                            model_preds, close, sigma, target_vol=self.target_vol, cap=self.position_cap
+                        pos = return_forecast_to_position(
+                            model_preds, sigma, target_vol=self.target_vol, cap=self.position_cap
                         )
                     else:
                         pos = np.clip(model_preds, -self.position_cap, self.position_cap)
@@ -816,7 +849,7 @@ class EnsembleModel(BaseModel):
                 else:
                     logger.warning("XLSTMGRPOAgent model was fitted but no save path was stored.")
             else:
-                # Forecast members (arima/prophet/lstm/xgboost) own their
+                # Forecast members (arima/prophet/xgboost) own their
                 # save(directory)/load(path); delegate to them and store the
                 # returned path RELATIVE to this ensemble dir so the run stays
                 # relocatable. Previously this branch was a no-op, so a loaded

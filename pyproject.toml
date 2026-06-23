@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trading-ensemble"
-version = "0.2.1"
+version = "0.2.2"
 authors = [
     {name = "Brendon Reperttang", email = "boom90lb@mit.alum.edu"},
 ]
@@ -19,39 +19,24 @@ classifiers = [
 
 dependencies = [
     "jax[cuda12]>=0.5.3",
-    "jax>=0.5.3",
-    "jaxlib>=0.5.3",
-    "jaxtyping>=0.3.1",
     "flax>=0.10.5",
-    "chex>=0.1.89",
     "distrax>=0.1.5",
     "optax>=0.2.4",
-    "einops>=0.8.1",
     "numpy>=1.24.0",
     "pandas>=2.0.0",
     "scikit-learn>=1.2.0",
     "matplotlib>=3.7.0",
-    "seaborn>=0.12.0",
     "statsmodels>=0.14.0",
     "prophet>=1.1.0",
     "xgboost>=1.7.0",
     "torch>=2.0.0",
     "transformers>=4.40.0",
     "gymnasium>=0.29.0",
-    "plotly>=6.0.1",
-    "stable-baselines3>=2.0.0",
-    "twelvedata>=1.2.10",
-    "polygon-api-client>=0.2.11",
-    "joblib>=1.2.0",
     "mlflow>=3.0.0",
-    "optuna>=3.0.0",
     "pyarrow>=10.0.0",
     "tqdm>=4.64.0",
     "python-dotenv>=1.0.0",
     "requests>=2.30.0",
-    "pandas-stubs>=2.2.3.250308",
-    "types-tqdm>=4.64.0.20250328",
-    "types-requests>=2.32.0.20250328",
 ]
 
 [project.optional-dependencies]
@@ -61,6 +46,9 @@ dev = [
     "isort>=5.10.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
+    "pandas-stubs>=2.2.3.250308",
+    "types-tqdm>=4.64.0.20250328",
+    "types-requests>=2.32.0.20250328",
 ]
 
 [project.urls]
@@ -70,7 +58,7 @@ dev = [
 [project.scripts]
 trading-backtest = "scripts.backtest:main"
 trading-prediction = "scripts.prediction:main"
-trading-stat-arb = "scripts.stat_arb:main"
+trading-stat-arb-residual-wfo = "scripts.stat_arb_residual_wfo:main"
 trading-stat-arb-wfo = "scripts.stat_arb_wfo:main"
 trading-training = "scripts.training:main"
 

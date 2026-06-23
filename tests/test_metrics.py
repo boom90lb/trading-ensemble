@@ -21,7 +21,9 @@ import pytest
 from src.validation.metrics import (
     calmar_ratio,
     deflated_sharpe_ratio,
+    deflated_sharpe_ratio_with_n,
     expected_max_sharpe,
+    expected_max_sharpe_with_n,
     periodic_sharpe,
     probabilistic_sharpe_ratio,
     probability_backtest_overfitting,
@@ -109,6 +111,33 @@ def test_expected_max_sharpe_identical_trials_zero() -> None:
 
 def test_expected_max_sharpe_single_trial_nan() -> None:
     assert math.isnan(expected_max_sharpe(np.array([0.5])))
+
+
+def test_expected_max_with_n_monotonic_in_N() -> None:
+    s = np.array([0.05, 0.10, 0.15, 0.20])
+    # Searching more configurations raises the benchmark Sharpe to beat.
+    assert expected_max_sharpe_with_n(s, 100) > expected_max_sharpe_with_n(s, 10)
+    # An explicit N above the observed count deflates harder than the ledger-only version.
+    assert expected_max_sharpe_with_n(s, 100) > expected_max_sharpe(s)
+
+
+def test_deflated_with_n_floors_at_observed() -> None:
+    rng = np.random.default_rng(0)
+    returns = pd.Series(rng.normal(0.001, 0.01, 500))
+    s = np.array([0.05, 0.10, 0.15, 0.20])
+    # n_trials below the observed count is floored to len(s) => identical to plain DSR.
+    assert expected_max_sharpe_with_n(s, 2) == pytest.approx(expected_max_sharpe(s))
+    assert deflated_sharpe_ratio_with_n(returns, s, 2) == pytest.approx(deflated_sharpe_ratio(returns, s))
+
+
+def test_with_n_matches_plain_when_equal() -> None:
+    s = np.array([0.05, 0.10, 0.15, 0.20])
+    assert expected_max_sharpe_with_n(s, len(s)) == pytest.approx(expected_max_sharpe(s))
+    rng = np.random.default_rng(1)
+    returns = pd.Series(rng.normal(0.001, 0.01, 400))
+    assert deflated_sharpe_ratio_with_n(returns, s, len(s)) == pytest.approx(
+        deflated_sharpe_ratio(returns, s)
+    )
 
 
 # ---------- DSR ----------

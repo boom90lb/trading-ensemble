@@ -145,8 +145,36 @@ def _cost_row(
     *,
     cost_multiplier: float,
     dividend_return: float,
+    dollar_volume: pd.Series | None = None,
+    initial_capital: float = 1.0,
 ) -> dict[str, float]:
-    trade_abs = trade.abs()
+    aligned_dollar_volume = (
+        None
+        if dollar_volume is None
+        else dollar_volume.reindex(trade.index).to_numpy(dtype=float)
+    )
+    return _cost_values(
+        trade.to_numpy(dtype=float),
+        weights.to_numpy(dtype=float),
+        execution,
+        cost_multiplier=cost_multiplier,
+        dividend_return=dividend_return,
+        dollar_volume=aligned_dollar_volume,
+        initial_capital=initial_capital,
+    )
+
+
+def _cost_values(
+    trade: np.ndarray,
+    weights: np.ndarray,
+    execution: ExecutionConfig,
+    *,
+    cost_multiplier: float,
+    dividend_return: float,
+    dollar_volume: np.ndarray | None = None,
+    initial_capital: float = 1.0,
+) -> dict[str, float]:
+    trade_abs = np.abs(trade)
     commission_spread = float(
         trade_abs.sum()
         * (execution.commission_bps + execution.spread_bps)
@@ -154,12 +182,20 @@ def _cost_row(
         * cost_multiplier
     )
     impact = float(
-        trade_abs.pow(2).sum()
+        np.square(trade_abs).sum()
         * execution.slippage_coeff
         / 10_000.0
         * cost_multiplier
     )
-    short_gross = float(weights.clip(upper=0.0).abs().sum())
+    if execution.adv_impact_coeff > 0.0 and dollar_volume is not None:
+        valid = np.isfinite(dollar_volume)
+        adv = np.where(valid, np.maximum(dollar_volume, execution.adv_floor_dollars), np.nan)
+        participation = trade_abs * float(initial_capital) / adv
+        if execution.adv_impact_model == "sqrt":
+            participation = np.sqrt(participation)
+        adv_bps = execution.adv_impact_coeff * participation
+        impact += float(np.nansum(trade_abs * adv_bps / 10_000.0) * cost_multiplier)
+    short_gross = float(np.abs(np.minimum(weights, 0.0)).sum())
     borrow = float(
         short_gross
         * execution.borrow_rate_bps_annual
@@ -173,7 +209,7 @@ def _cost_row(
         "borrow": borrow,
         "total": total,
         "turnover": float(trade_abs.sum()),
-        "gross": float(weights.abs().sum()),
+        "gross": float(np.abs(weights).sum()),
         "net": float(weights.sum()),
         "dividend_return": float(dividend_return),
     }
@@ -207,6 +243,20 @@ def _target_from_row(row: pd.Series, current_weights: pd.Series) -> pd.Series | 
     return row.where(row.notna(), current_weights).astype(float)
 
 
+def _target_from_values(row: np.ndarray, current_weights: np.ndarray) -> np.ndarray | None:
+    """Resolve a target row, treating all-NaN as "drop/no new pending target"."""
+    if np.isnan(row).all():
+        return None
+    return np.where(np.isnan(row), current_weights, row).astype(float)
+
+
+def _scale_row_to_max_gross(row: np.ndarray, max_gross: float) -> np.ndarray:
+    gross = float(np.abs(row).sum())
+    if gross > max_gross:
+        return row * (max_gross / gross)
+    return row
+
+
 def backtest_target_weights(
     open_prices: pd.DataFrame,
     target_weights: pd.DataFrame,
@@ -217,6 +267,7 @@ def backtest_target_weights(
     rebalance_cost_multiplier: float = 1.0,
     max_gross_exposure: float | None = None,
     dividends: pd.DataFrame | Mapping[str, pd.Series] | None = None,
+    dollar_volume: pd.DataFrame | None = None,
 ) -> PortfolioBacktestResult:
     """Backtest close-time target weights with next-open fills.
 
@@ -250,6 +301,7 @@ def backtest_target_weights(
         scaled_values = scale_to_max_gross(targets.fillna(0.0), max_gross=max_gross_exposure)
         targets = scaled_values.where(targets.notna())
     divs = _dividend_frame(dividends, index, symbols)
+    dvol = None if dollar_volume is None else _aligned_numeric(dollar_volume).reindex(index=index, columns=symbols)
 
     if len(index) < 2:
         empty = pd.Series(dtype=float, name="daily_return")
@@ -262,53 +314,65 @@ def backtest_target_weights(
             metrics=compute_portfolio_metrics(empty, pd.Series(dtype=float), _empty_costs(empty.index)),
         )
 
-    current = pd.Series(0.0, index=symbols, dtype=float)
-    pending: pd.Series | None = None
-    fill_rows: list[pd.Series] = []
+    prices_arr = prices.to_numpy(dtype=float)
+    targets_arr = targets.to_numpy(dtype=float)
+    divs_arr = divs.to_numpy(dtype=float)
+    dvol_arr = None if dvol is None else dvol.to_numpy(dtype=float)
+
+    current = np.zeros(len(symbols), dtype=float)
+    pending: np.ndarray | None = None
+    fill_rows: list[np.ndarray] = []
     return_rows: list[float] = []
     cost_rows: list[dict[str, float]] = []
     return_index = index[:-1]
 
-    for date in return_index:
+    for pos, date in enumerate(return_index):
         previous = current.copy()
         if pending is not None:
             current = pending.copy()
             pending = None
         trade = current - previous
 
-        next_pos = index.get_loc(date) + 1
-        next_date = index[next_pos]
-        open_ret = prices.loc[next_date, symbols] / prices.loc[date, symbols] - 1.0
-        dividend_return = float(
-            (
-                current
-                * divs.loc[next_date, symbols]
-                / prices.loc[date, symbols].replace(0.0, np.nan)
-            )
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(0.0)
-            .sum()
+        next_pos = pos + 1
+        open_ret = np.divide(
+            prices_arr[next_pos],
+            prices_arr[pos],
+            out=np.ones(len(symbols), dtype=float),
+            where=prices_arr[pos] != 0.0,
+        ) - 1.0
+        open_ret = np.nan_to_num(open_ret, nan=0.0, posinf=0.0, neginf=0.0)
+        dividend_by_name = np.divide(
+            divs_arr[next_pos],
+            prices_arr[pos],
+            out=np.zeros(len(symbols), dtype=float),
+            where=prices_arr[pos] != 0.0,
         )
-        cost = _cost_row(
+        dividend_by_name = np.nan_to_num(dividend_by_name, nan=0.0, posinf=0.0, neginf=0.0)
+        dividend_return = float(
+            (current * dividend_by_name).sum()
+        )
+        cost = _cost_values(
             trade,
             current,
             execution,
             cost_multiplier=rebalance_cost_multiplier,
             dividend_return=dividend_return,
+            dollar_volume=None if dvol_arr is None else dvol_arr[pos],
+            initial_capital=initial_capital,
         )
-        gross_return = float((current * open_ret.fillna(0.0)).sum()) + dividend_return
+        gross_return = float((current * open_ret).sum()) + dividend_return
         return_rows.append(gross_return - cost["total"])
-        fill_rows.append(current.rename(date))
+        fill_rows.append(current.copy())
         cost_rows.append(cost)
 
-        row_target = _target_from_row(targets.loc[date, symbols], current)
+        row_target = _target_from_values(targets_arr[pos], current)
         if row_target is None:
             continue
         delta = row_target - current
-        effective = current.where(delta.abs() <= rebalance_band_weight, row_target)
+        effective = np.where(np.abs(delta) <= rebalance_band_weight, current, row_target)
         if max_gross_exposure is not None:
-            effective = scale_to_max_gross(effective.to_frame().T, max_gross=max_gross_exposure).iloc[0]
-        if not np.allclose(effective.to_numpy(dtype=float), current.to_numpy(dtype=float)):
+            effective = _scale_row_to_max_gross(effective, max_gross_exposure)
+        if not np.allclose(effective, current):
             pending = effective.astype(float)
 
     returns = pd.Series(return_rows, index=return_index, name="daily_return")
@@ -323,8 +387,3 @@ def backtest_target_weights(
         costs=costs,
         metrics=compute_portfolio_metrics(returns, equity, costs),
     )
-
-
-def metrics_to_frame(metrics_by_name: Mapping[str, dict[str, float]]) -> pd.DataFrame:
-    """Small reporting helper used by scripts."""
-    return pd.DataFrame(metrics_by_name).T.sort_index()

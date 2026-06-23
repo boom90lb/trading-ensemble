@@ -55,7 +55,8 @@ from src.execution.target_weights import (
     backtest_target_weights,
     scale_to_max_gross,
 )
-from src.features import FeatureEngineer
+from src.portfolio.construct import construct_directional_targets
+from src.features import FeatureEngineer, forward_return_column
 from src.models.base import BaseModel
 from src.models.ensemble import EnsembleModel
 from src.sentiment_analysis import SentimentAnalyzer
@@ -126,6 +127,9 @@ def parse_args():
     parser.add_argument("--commission_bps", type=float, default=1.0)
     parser.add_argument("--spread_bps", type=float, default=1.0)
     parser.add_argument("--slippage_coeff", type=float, default=10.0)
+    parser.add_argument("--adv_impact_coeff", type=float, default=0.0)
+    parser.add_argument("--adv_impact_model", type=str, default="linear", choices=["linear", "sqrt"])
+    parser.add_argument("--adv_floor_dollars", type=float, default=100000.0)
     parser.add_argument("--borrow_bps_annual", type=float, default=50.0)
     parser.add_argument(
         "--order_type", type=str, default="MOO", choices=["MOO", "MOC"],
@@ -170,6 +174,13 @@ def parse_args():
     parser.add_argument("--rebalance_band_weight", type=float, default=0.0)
     parser.add_argument("--rebalance_cost_multiplier", type=float, default=1.0)
     parser.add_argument("--max_gross_exposure", type=float, default=1.0)
+    parser.add_argument(
+        "--construct_style",
+        type=str,
+        default="legacy",
+        choices=["legacy", "shared"],
+        help="Target construction path for ensemble scores; 'shared' is opt-in until parity gates pass.",
+    )
 
     # DSR: path to a sweep's trial_sharpes JSON ({"trial_sharpes": [...]}).
     # When given, the report deflates the ensemble's Sharpe against the
@@ -245,6 +256,9 @@ def _build_execution_and_trading_configs(args) -> Tuple[ExecutionConfig, Trading
         slippage_coeff=args.slippage_coeff,
         commission_bps=args.commission_bps,
         borrow_rate_bps_annual=args.borrow_bps_annual,
+        adv_impact_coeff=getattr(args, "adv_impact_coeff", 0.0),
+        adv_impact_model=getattr(args, "adv_impact_model", "linear"),
+        adv_floor_dollars=getattr(args, "adv_floor_dollars", 100000.0),
         default_order_type=args.order_type,
     )
     trading_config = TradingConfig(
@@ -276,26 +290,6 @@ def _load_fold_metadata(fold_dir: Path) -> Dict[str, Any]:
             f"{schema_version} in {metadata_path}"
         )
     return metadata
-
-
-def _slice_by_span(
-    usable: pd.DataFrame,
-    span: Optional[Dict[str, str]],
-) -> pd.DataFrame:
-    if span is None:
-        return usable.iloc[0:0]
-    start = pd.Timestamp(span["start"])
-    end = pd.Timestamp(span["end"])
-    index_tz = usable.index.tz if isinstance(usable.index, pd.DatetimeIndex) else None
-    if index_tz is not None and start.tzinfo is None:
-        start = start.tz_localize(index_tz)
-    if index_tz is not None and end.tzinfo is None:
-        end = end.tz_localize(index_tz)
-    if index_tz is None and start.tzinfo is not None:
-        start = start.tz_convert(None)
-    if index_tz is None and end.tzinfo is not None:
-        end = end.tz_convert(None)
-    return usable.loc[(usable.index >= start) & (usable.index <= end)]
 
 
 def _slice_by_exact_index(
@@ -467,7 +461,7 @@ def run_symbol_wfo(
             strategy.model = load_fold_model(fold_dir, horizon)
 
         ensemble_wfo = load_fold_model is not None
-        target_col = f"target_{horizon}" if horizon is not None else None
+        target_col = forward_return_column(horizon) if horizon is not None else None
         date_range = _fold_date_range(
             fold_dir,
             usable,
@@ -599,6 +593,78 @@ def _drop_fold_last_target(segment: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _generate_symbol_shared_target_weights(
+    symbol: str,
+    fold_dirs: List[Path],
+    full_df: pd.DataFrame,
+    usable: pd.DataFrame,
+    args,
+    horizon: int,
+) -> pd.DataFrame:
+    """Generate unhedged targets from signed ensemble scores via shared construct."""
+    _, trading_config = _build_execution_and_trading_configs(args)
+    segments: List[pd.DataFrame] = []
+    target_col = forward_return_column(horizon)
+
+    for fold_dir in fold_dirs:
+        model = load_fold_ensemble(fold_dir, horizon)
+        date_range = _fold_date_range(
+            fold_dir,
+            usable,
+            require_metadata=True,
+            symbol=symbol,
+            horizon=horizon,
+            target_col=target_col,
+        )
+        if date_range is None:
+            continue
+        start_d, end_d = date_range
+        model_frame = TradingStrategy._without_label_columns(
+            _fold_model_data(fold_dir, symbol=symbol, full_df=full_df)
+        )
+        policy_frame = TradingStrategy._without_label_columns(full_df)
+        hist = getattr(model, "required_history", 1)
+        all_dates = model_frame.index.intersection(policy_frame.index).sort_values()
+        all_dates = all_dates[(all_dates >= start_d) & (all_dates <= end_d)]
+
+        rows: List[Dict[str, Any]] = []
+        for date in all_dates:
+            model_window = TradingStrategy._trailing_window_at(model_frame, date, hist)
+            policy_window = TradingStrategy._trailing_window_at(policy_frame, date, hist)
+            if model_window is None or policy_window is None:
+                continue
+            features_df, _ = model_window
+            policy_features_df, _ = policy_window
+            try:
+                if isinstance(model, EnsembleModel):
+                    scores = model.score(features_df, policy_X=policy_features_df)
+                else:
+                    scores = model.predict(features_df)
+            except Exception as e:
+                logger.error(f"Error scoring shared construct target for {symbol} on {date}: {e}")
+                continue
+            latest = float(scores[-1]) if len(scores) else np.nan
+            rows.append({"date": date, symbol: latest})
+
+        if rows:
+            score_frame = pd.DataFrame(rows).set_index("date").reindex(columns=[symbol])
+            per_symbol_cap = min(
+                float(trading_config.position_size),
+                float(trading_config.max_gross_exposure),
+            )
+            targets = construct_directional_targets(
+                score_frame,
+                position_size=trading_config.position_size,
+                max_gross=per_symbol_cap,
+                max_symbol_abs_weight=per_symbol_cap,
+            )
+            segments.append(_drop_fold_last_target(targets))
+
+    if not segments:
+        return pd.DataFrame(columns=[symbol], dtype=float)
+    return pd.concat(segments).sort_index().reindex(columns=[symbol])
+
+
 def generate_symbol_target_weights(
     symbol: str,
     fold_dirs: List[Path],
@@ -610,6 +676,16 @@ def generate_symbol_target_weights(
     horizon: int,
 ) -> pd.DataFrame:
     """Generate close-time target weights for one symbol across WFO folds."""
+    if getattr(args, "construct_style", "legacy") == "shared":
+        return _generate_symbol_shared_target_weights(
+            symbol=symbol,
+            fold_dirs=fold_dirs,
+            full_df=full_df,
+            usable=usable,
+            args=args,
+            horizon=horizon,
+        )
+
     execution_config, trading_config = _build_execution_and_trading_configs(args)
     first_model = load_fold_ensemble(fold_dirs[0], horizon)
     strategy = TradingStrategy(
@@ -621,7 +697,7 @@ def generate_symbol_target_weights(
     )
 
     segments: List[pd.DataFrame] = []
-    target_col = f"target_{horizon}"
+    target_col = forward_return_column(horizon)
     for fold_idx, fold_dir in enumerate(fold_dirs):
         if fold_idx > 0:
             strategy.model = load_fold_ensemble(fold_dir, horizon)
@@ -704,6 +780,7 @@ def run_portfolio_target_weight_wfo(
     execution_config, trading_config = _build_execution_and_trading_configs(args)
     targets_by_symbol: Dict[str, pd.DataFrame] = {}
     open_prices: Dict[str, pd.Series] = {}
+    dollar_volumes: Dict[str, pd.Series] = {}
     dividends_by_symbol: Dict[str, Optional[pd.Series]] = {}
     symbols_run: List[str] = []
 
@@ -726,10 +803,10 @@ def run_portfolio_target_weight_wfo(
             sentiment_analyzer=sentiment_analyzer,
             horizon=horizon,
         )
-        target_col = f"target_{horizon}"
+        target_col = forward_return_column(horizon)
         if target_col not in full_df.columns:
             logger.error(
-                f"target_{horizon} missing from features for {symbol}; "
+                f"{target_col} missing from features for {symbol}; "
                 "training config mismatch"
             )
             continue
@@ -749,6 +826,10 @@ def run_portfolio_target_weight_wfo(
             continue
         targets_by_symbol[symbol] = targets
         open_prices[symbol] = raw_df["open"].astype(float)
+        if {"close", "volume"} <= set(raw_df.columns):
+            dollar_volumes[symbol] = raw_df["close"].astype(float) * raw_df["volume"].astype(float)
+        elif execution_config.adv_impact_coeff > 0.0:
+            logger.warning(f"No close/volume dollar-volume panel for {symbol}; ADV impact disabled for it")
         dividends_by_symbol[symbol] = (
             None if args.no_dividends else data_loader.fetch_dividends(
                 symbol=symbol,
@@ -765,6 +846,11 @@ def run_portfolio_target_weight_wfo(
     if target_matrix.empty:
         raise RuntimeError("No target-weight portfolio could be generated.")
     open_matrix = pd.DataFrame(open_prices).sort_index().reindex(target_matrix.index)
+    dollar_volume_matrix = (
+        pd.DataFrame(dollar_volumes).sort_index().reindex(target_matrix.index)
+        if dollar_volumes
+        else pd.DataFrame(index=target_matrix.index)
+    )
     dividends_frame = pd.DataFrame(
         {symbol: div for symbol, div in dividends_by_symbol.items() if div is not None}
     )
@@ -777,6 +863,7 @@ def run_portfolio_target_weight_wfo(
         rebalance_cost_multiplier=trading_config.rebalance_cost_multiplier,
         max_gross_exposure=trading_config.max_gross_exposure,
         dividends=None if dividends_frame.empty else dividends_frame,
+        dollar_volume=None if dollar_volume_matrix.empty else dollar_volume_matrix,
     )
     equity_curve = _target_weight_equity_curve(
         result,
@@ -828,6 +915,7 @@ def run_portfolio_target_weight_wfo(
         "initial_capital": args.initial_capital,
         "position_size": args.position_size,
         "execution_style": "target_weights",
+        "construct_style": getattr(args, "construct_style", "legacy"),
         "rebalance_band_weight": args.rebalance_band_weight,
         "rebalance_cost_multiplier": args.rebalance_cost_multiplier,
         "max_gross_exposure": args.max_gross_exposure,
@@ -835,6 +923,9 @@ def run_portfolio_target_weight_wfo(
             "commission_bps": args.commission_bps,
             "spread_bps": args.spread_bps,
             "slippage_coeff": args.slippage_coeff,
+            "adv_impact_coeff": getattr(args, "adv_impact_coeff", 0.0),
+            "adv_impact_model": getattr(args, "adv_impact_model", "linear"),
+            "adv_floor_dollars": getattr(args, "adv_floor_dollars", 100000.0),
             "borrow_bps_annual": args.borrow_bps_annual,
             "order_type": args.order_type,
         },
@@ -855,6 +946,10 @@ def run_portfolio_target_weight_wfo(
         "universe_policy": "training_run_symbol_list",
     }
     packet_summary: Dict[str, Any] = {**result.metrics, "dsr": dsr_value}
+    packet_min_obs = 20
+    if getattr(args, "construct_style", "legacy") == "shared":
+        packet_summary["claim_blocker"] = "train_serve_prediction_parity_required_for_directional_edge_claims"
+        packet_min_obs = max(20, len(result.returns) + 1)
     if trial_sharpes is not None:
         packet_summary["n_trials"] = int(trial_sharpes.size)
     packet = emit_research_claim_packet(
@@ -869,6 +964,7 @@ def run_portfolio_target_weight_wfo(
         summary=packet_summary,
         artifacts=artifacts,
         code_commit=current_git_commit(RESULTS_DIR.parent),
+        min_obs=packet_min_obs,
     )
     metrics_payload.update(
         summary_claim_fields(packet, packet_filename=artifacts["claim_packet"])
@@ -1094,9 +1190,13 @@ def main():
             "commission_bps": args.commission_bps,
             "spread_bps": args.spread_bps,
             "slippage_coeff": args.slippage_coeff,
+            "adv_impact_coeff": getattr(args, "adv_impact_coeff", 0.0),
+            "adv_impact_model": getattr(args, "adv_impact_model", "linear"),
+            "adv_floor_dollars": getattr(args, "adv_floor_dollars", 100000.0),
             "borrow_bps_annual": args.borrow_bps_annual,
             "order_type": args.order_type,
             "execution_style": args.execution_style,
+            "construct_style": args.construct_style,
             "rebalance_band_weight": args.rebalance_band_weight,
             "rebalance_cost_multiplier": args.rebalance_cost_multiplier,
             "max_gross_exposure": args.max_gross_exposure,
@@ -1163,10 +1263,10 @@ def main():
                 sentiment_analyzer=sentiment_analyzer,
                 horizon=horizon,
             )
-            target_col = f"target_{horizon}"
+            target_col = forward_return_column(horizon)
             if target_col not in full_df.columns:
                 logger.error(
-                    f"target_{horizon} missing from features for {symbol}; "
+                    f"{target_col} missing from features for {symbol}; "
                     "training config mismatch"
                 )
                 continue
@@ -1324,6 +1424,9 @@ def main():
                         "commission_bps": args.commission_bps,
                         "spread_bps": args.spread_bps,
                         "slippage_coeff": args.slippage_coeff,
+                        "adv_impact_coeff": getattr(args, "adv_impact_coeff", 0.0),
+                        "adv_impact_model": getattr(args, "adv_impact_model", "linear"),
+                        "adv_floor_dollars": getattr(args, "adv_floor_dollars", 100000.0),
                         "borrow_bps_annual": args.borrow_bps_annual,
                     },
                     "models": trained_models,

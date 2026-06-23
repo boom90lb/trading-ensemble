@@ -28,22 +28,21 @@ lives in the README; this file is the "what will actually bite you" companion.
 
 Not every configured member feeds the backtest blend:
 
-- **arima, prophet, xgboost** — contribute. (Prophet needs a tz-naive `ds`;
-  the model strips the zone internally, but that's why the bars being
-  tz-localized matters.)
-- **forecast `lstm`** — currently **dropped** in the backtest blend.
-  `EnsembleModel._predict_positions_per_model` discards any member whose
-  `predict` returns `len(raw) != len(X)`, and the forecast LSTM returns
-  `len - sequence_length + 1`. Until that length reconciliation is built, an
-  ensemble's forecast-LSTM member is silently renormalized out of the backtest.
+- **xgboost** — default forecast member. Forecast members now train on forward
+  returns and map those expected returns to positions.
+- **arima, prophet** — opt-in diagnostics only. They still contribute when
+  explicitly requested, but are no longer in the default production selection:
+  ARIMA's fitted state is not live-updated during scoring, and Prophet adds a
+  broad regressor set that is too easy to overfit.
+- **forecast `lstm`** — removed from the implementation and rejected by
+  `--models lstm`; rebuild it as a return-target model only if it earns its way
+  back.
 - **RL policy members (lstm_ppo / xlstm_ppo / xlstm_grpo)** — pad to `len(X)`,
   so they are kept, but see the performance note below.
 
-**Practical consequence:** for a forecast-only backtest, training with
-`--models arima,prophet,xgboost` produces the same backtest blend as
-`arima,prophet,lstm,xgboost` (the LSTM is dropped anyway) **and avoids the
-per-bar JAX cost below**. Use the 3-member set unless/until the LSTM length
-reconciliation lands.
+**Practical consequence:** for a forecast-only backtest, train with
+`--models xgboost`. Add `arima` or `prophet` only for a deliberate diagnostic
+run.
 
 ## Performance: per-bar prediction cost
 
@@ -71,12 +70,17 @@ echo "TWELVEDATA_API_KEY=..." > .env
 .venv/bin/python3 -m scripts.training \
   --symbols AAPL,MSFT,GOOG,AMZN \
   --start_date 2020-01-01 --end_date <today> \
-  --horizon 5 --n_splits 5 --models arima,prophet,xgboost
+  --horizon 5 --n_splits 5 --models xgboost
 
 # 3. backtest the run (basic tier -> --no_dividends)
 PYTHONWARNINGS=ignore .venv/bin/python3 -m scripts.backtest \
   --training_run runs/<run_name> --no_dividends
 ```
+
+Capacity impact is opt-in and defaults to off. To charge participation against
+per-symbol dollar volume, add `--adv_impact_coeff <bps-coeff>` and, if needed,
+`--adv_floor_dollars <floor>`; the main WFO backtest and residual stat-arb WFO
+derive dollar volume from the existing close x volume bars.
 
 Artifacts: `runs/<run_name>/{symbol}/fold_*/ensemble_model/` (per-fold models +
 `split_idx.npz`), backtest report under `results/wfo_backtest_<ts>/`. Both

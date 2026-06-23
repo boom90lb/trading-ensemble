@@ -9,7 +9,7 @@ fold is flattened before the next fold can trade.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Literal
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,7 @@ from src.arbitrage.pairs import (
     generate_pair_positions,
     scan_cointegrated_pairs_with_report,
 )
-from src.arbitrage.portfolio import (
+from src.execution.target_weights import (
     PortfolioBacktestResult,
     backtest_target_weights,
     combine_pair_positions,
@@ -44,6 +44,8 @@ class StatArbWalkForwardConfig:
     min_test_bars: int = 20
     max_gross: float = 1.0
     max_symbol_abs_weight: float = 0.35
+    no_trade_band: float = 0.0
+    band_mode: Literal["fixed", "cost_aware"] = "fixed"
     close_positions_at_fold_end: bool = True
 
     def __post_init__(self) -> None:
@@ -61,6 +63,10 @@ class StatArbWalkForwardConfig:
             raise ValueError(
                 f"max_symbol_abs_weight must be > 0, got {self.max_symbol_abs_weight}"
             )
+        if self.no_trade_band < 0:
+            raise ValueError(f"no_trade_band must be >= 0, got {self.no_trade_band}")
+        if self.band_mode not in ("fixed", "cost_aware"):
+            raise ValueError(f"band_mode must be 'fixed' or 'cost_aware', got {self.band_mode!r}")
         if not self.close_positions_at_fold_end:
             raise ValueError("carry rules are not implemented; folds must be flattened")
 
@@ -159,6 +165,7 @@ def _candidate_to_dict(candidate: PairCandidate) -> dict[str, float | int | str]
         "beta_drift": float(candidate.beta_drift),
         "return_corr": float(candidate.return_corr),
         "n_obs": int(candidate.n_obs),
+        "evidence_weight": float(candidate.evidence_weight),
     }
 
 
@@ -167,6 +174,7 @@ def pair_selection_report_to_dict(report: PairSelectionReport) -> dict[str, obje
     return {
         "n_symbols": int(report.n_symbols),
         "n_symbol_pairs": int(report.n_symbol_pairs),
+        "n_prior_admitted": int(report.n_prior_admitted),
         "n_raw_candidates": int(report.n_raw_candidates),
         "fdr_alpha": float(report.fdr_alpha),
         "fdr_cutoff": None if report.fdr_cutoff is None else float(report.fdr_cutoff),
@@ -316,6 +324,9 @@ def run_stat_arb_walk_forward(
         for candidate in candidates:
             signal_frame = generate_pair_positions(signal_close, candidate, signal_config)
             target = signal_frame.target_weights.reindex(test_index).fillna(0.0)
+            # shrunk_candidates scales each pair by its evidence weight before the book is
+            # combined; in fdr_hard mode every weight is 1.0, so this is a no-op (parity).
+            target = target * float(candidate.evidence_weight)
             target = _force_fold_flat(target)
             pair_targets.append(target)
 

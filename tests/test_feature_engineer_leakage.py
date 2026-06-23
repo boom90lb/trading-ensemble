@@ -9,6 +9,8 @@ the recompute with stored fit-time bounds from fit_scalers.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -45,6 +47,28 @@ def test_clip_bounds_recorded_after_fit():
     train_std = float(fit_subset.std())
     assert abs(lo - (train_mean - 3 * train_std)) < 1e-6
     assert abs(hi - (train_mean + 3 * train_std)) < 1e-6
+
+
+def test_lagged_features_concat_once_without_label_lags():
+    fe = FeatureEngineer()
+    idx = pd.date_range("2024-01-01", periods=20, freq="B", tz="America/New_York")
+    df = pd.DataFrame(
+        {f"feature_{i}": np.arange(len(idx), dtype=float) + i + 1.0 for i in range(80)},
+        index=idx,
+    )
+    df["target_1"] = df["feature_0"].shift(-1)
+    df["direction_1"] = 1.0
+    df["pct_change_1"] = df["target_1"] / df["feature_0"] - 1.0
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", pd.errors.PerformanceWarning)
+        out = fe.create_lagged_features(df, [1, 2, 5])
+
+    assert not any(isinstance(w.message, pd.errors.PerformanceWarning) for w in caught)
+    assert "feature_0_lag1" in out.columns
+    assert "target_1_lag1" not in out.columns
+    assert "direction_1_lag1" not in out.columns
+    assert "pct_change_1_lag1" not in out.columns
 
 
 def test_transform_does_not_depend_on_test_distribution():
@@ -145,6 +169,7 @@ def test_feature_transform_raises_on_scaler_shape_drift():
     test_df = fe.create_features(_ohlcv(seed=1))
     fe.fit_scalers(train, "AAPL")
 
-    fe.price_scalers["AAPL"].min_vals.value = fe.price_scalers["AAPL"].min_vals.value[:-1]
+    min_vals = fe.price_scalers["AAPL"].min_vals
+    min_vals.set_value(min_vals.get_value()[:-1])
     with pytest.raises(ValueError, match="price scaler shape mismatch"):
         fe.transform_features(test_df, "AAPL", is_train=False)

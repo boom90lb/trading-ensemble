@@ -11,6 +11,7 @@ import pandas as pd
 from prophet import Prophet
 
 from src.config import MODELS_DIR
+from src.features import is_label_column
 from src.models.base import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ class ProphetModel(BaseModel):
             regressors_to_add = {}
             for feature in X_train.columns:
                 # Avoid adding base price/volume columns or target columns as regressors
-                if feature not in ["open", "high", "low", "close", "volume"] and not feature.startswith("target_"):
+                if feature not in ["open", "high", "low", "close", "volume"] and not is_label_column(feature):
                     try:
                         # Ensure the column exists and can be added
                         if feature in X_train:

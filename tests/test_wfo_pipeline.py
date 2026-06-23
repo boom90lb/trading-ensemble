@@ -28,6 +28,7 @@ import pytest
 from src.baselines import BuyAndHold
 from src.config import EnsembleConfig, ExecutionConfig, ModelConfig, TradingConfig
 from src.execution import ExecutionModel
+from src.features import forward_return_column, is_label_column
 from src.models.base import BaseModel
 from src.models.ensemble import EnsembleModel
 from src.trading import TradingStrategy
@@ -74,7 +75,7 @@ def _write_fold_replay_artifacts(
     train_scaled = fe.transform_features(train_raw, symbol, is_train=True)
     feature_columns = [
         c for c in train_scaled.columns
-        if "target_" not in c and "direction_" not in c
+        if not is_label_column(c)
     ]
     fe.save_state(
         fold_dir / "feature_engineer_state.pkl",
@@ -264,7 +265,7 @@ def _make_conformal_frame(n: int = 300, seed: int = 7) -> pd.DataFrame:
 
 
 def _build_conformal_ensemble(df: pd.DataFrame, horizon: int = 5) -> EnsembleModel:
-    y = df["close"].shift(-horizon).dropna()
+    y = df["close"].shift(-horizon).div(df["close"]).sub(1.0).dropna()
     X = df.loc[y.index]
     ensemble = EnsembleModel(
         target_column="close",
@@ -352,7 +353,7 @@ class _RecordingForecast(BaseModel):
 
     def predict(self, X):
         self.seen_close.append([float(v) for v in X["close"].to_numpy()])
-        return X["close"].to_numpy(dtype=float)
+        return np.zeros(len(X), dtype=float)
 
     def save(self, directory: Path) -> Path:
         return Path(directory)
@@ -508,7 +509,8 @@ def test_train_symbol_wfo_produces_per_fold_artifacts(monkeypatch, tmp_path):
         feature_engineer=fe, sentiment_analyzer=None,
         horizon=5,
     )
-    assert "target_5" in full_df.columns
+    target_col = forward_return_column(5)
+    assert target_col in full_df.columns
 
     training_config = TrainingConfig(
         symbols=["SYM"], timeframe="1d",
@@ -549,7 +551,7 @@ def test_train_symbol_wfo_produces_per_fold_artifacts(monkeypatch, tmp_path):
             per_fold = train_symbol_wfo(
                 symbol="SYM",
                 full_df=full_df,
-                target_col="target_5",
+                target_col=target_col,
                 splitter=splitter,
                 model_configs=model_configs,
                 model_names=["xgboost"],
@@ -603,6 +605,33 @@ def test_train_symbol_wfo_produces_per_fold_artifacts(monkeypatch, tmp_path):
     assert {h.step for h in history} >= set(range(len(fold_dirs)))
 
 
+def test_build_features_preserves_unobserved_forward_targets():
+    from scripts.training import build_features
+    from src.features import FeatureEngineer
+
+    horizon = 5
+    raw = _make_gbm_df(n=40, seed=19)
+    full_df = build_features(
+        raw_df=raw,
+        symbol="SYM",
+        feature_engineer=FeatureEngineer(),
+        sentiment_analyzer=None,
+        horizon=horizon,
+    )
+
+    target_col = f"target_{horizon}"
+    direction_col = f"direction_{horizon}"
+    pct_col = forward_return_column(horizon)
+
+    assert full_df[target_col].tail(horizon).isna().all()
+    assert full_df[direction_col].tail(horizon).isna().all()
+    assert full_df[pct_col].tail(horizon).isna().all()
+
+    usable = full_df.dropna(subset=[pct_col]).copy()
+    assert len(usable) == len(full_df) - horizon
+    assert usable.index.max() == full_df.index[-horizon - 1]
+
+
 def test_train_symbol_wfo_writes_failed_fold_status(monkeypatch, tmp_path):
     import types
 
@@ -654,7 +683,7 @@ def test_train_symbol_wfo_writes_failed_fold_status(monkeypatch, tmp_path):
     per_fold = train_symbol_wfo(
         symbol="SYM",
         full_df=full_df,
-        target_col="target_5",
+        target_col=forward_return_column(5),
         splitter=splitter,
         model_configs=[ModelConfig(name="xgboost", enabled=True, weight=1.0)],
         model_names=["xgboost"],
@@ -741,7 +770,7 @@ def test_backtest_wfo_persists_state_and_drops_pending_between_folds(
         feature_engineer=fe, sentiment_analyzer=None,
         horizon=5,
     )
-    usable = full_df.dropna(subset=["target_5"]).copy()
+    usable = full_df.dropna(subset=[forward_return_column(5)]).copy()
 
     # Two fake folds: first half + second half of `usable`.
     n = len(usable)
@@ -835,7 +864,8 @@ def test_backtest_wfo_swaps_model_per_fold(monkeypatch, tmp_path):
         raw_df=raw, symbol="SYM",
         feature_engineer=fe, sentiment_analyzer=None, horizon=5,
     )
-    usable = full_df.dropna(subset=["target_5"]).copy()
+    target_col = forward_return_column(5)
+    usable = full_df.dropna(subset=[target_col]).copy()
     n = len(usable)
 
     fold_root = tmp_path / "training_run" / "SYM"
@@ -856,7 +886,7 @@ def test_backtest_wfo_swaps_model_per_fold(monkeypatch, tmp_path):
             d,
             symbol="SYM",
             horizon=5,
-            target_col="target_5",
+            target_col=target_col,
             usable=usable,
             train_idx=train_idx,
             test_idx=test_slice,
@@ -915,7 +945,8 @@ def test_fold_metadata_validates_replay_index(tmp_path):
         raw_df=raw, symbol="SYM",
         feature_engineer=fe, sentiment_analyzer=None, horizon=5,
     )
-    usable = full_df.dropna(subset=["target_5"]).copy()
+    target_col = forward_return_column(5)
+    usable = full_df.dropna(subset=[target_col]).copy()
     train_idx = np.concatenate([np.arange(0, 20), np.arange(25, 30)])
     test_idx = np.arange(40, 60)
     fold_dir = tmp_path / "fold_0"
@@ -925,7 +956,7 @@ def test_fold_metadata_validates_replay_index(tmp_path):
         fold_dir,
         symbol="SYM",
         horizon=5,
-        target_col="target_5",
+        target_col=target_col,
         usable=usable,
         train_idx=train_idx,
         test_idx=test_idx,
@@ -937,7 +968,7 @@ def test_fold_metadata_validates_replay_index(tmp_path):
         require_metadata=True,
         symbol="SYM",
         horizon=5,
-        target_col="target_5",
+        target_col=target_col,
     )
     assert resolved == (usable.index[test_idx[0]], usable.index[test_idx[-1]])
 
@@ -949,7 +980,7 @@ def test_fold_metadata_validates_replay_index(tmp_path):
             require_metadata=True,
             symbol="SYM",
             horizon=5,
-            target_col="target_5",
+            target_col=target_col,
         )
 
 
@@ -964,7 +995,7 @@ def test_missing_fold_metadata_fails_loud_for_ensemble_replay(tmp_path):
         raw_df=raw, symbol="SYM",
         feature_engineer=fe, sentiment_analyzer=None, horizon=5,
     )
-    usable = full_df.dropna(subset=["target_5"]).copy()
+    usable = full_df.dropna(subset=[forward_return_column(5)]).copy()
     fold_dir = tmp_path / "fold_0"
     fold_dir.mkdir()
     np.savez(
@@ -980,7 +1011,7 @@ def test_missing_fold_metadata_fails_loud_for_ensemble_replay(tmp_path):
             require_metadata=True,
             symbol="SYM",
             horizon=5,
-            target_col="target_5",
+                target_col=forward_return_column(5),
         )
 
 

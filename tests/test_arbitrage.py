@@ -9,22 +9,23 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.arbitrage import (
+from src.arbitrage.pairs import (
     PairCandidate,
     PairSelectionConfig,
     PairSignalConfig,
-    StatArbWalkForwardConfig,
-    backtest_target_weights,
     benjamini_hochberg_mask,
-    combine_pair_positions,
-    fold_result_to_dict,
     generate_pair_positions,
-    run_stat_arb_walk_forward,
     scan_cointegrated_pairs,
     scan_cointegrated_pairs_with_report,
 )
 from src.arbitrage.pairs import _evidence_weights
+from src.arbitrage.walk_forward import (
+    StatArbWalkForwardConfig,
+    fold_result_to_dict,
+    run_stat_arb_walk_forward,
+)
 from src.config import ExecutionConfig
+from src.execution.target_weights import backtest_target_weights, combine_pair_positions
 
 
 def _synthetic_cointegrated_prices(n: int = 650) -> pd.DataFrame:
@@ -274,47 +275,64 @@ def test_walk_forward_selection_metadata_is_deterministic() -> None:
     assert first_reports == second_reports
 
 
-def _two_cointegrated_pairs_prices(n: int = 650) -> pd.DataFrame:
-    """Two independent cointegrated pairs of differing strength, plus no cross-pair link."""
-    rng = np.random.default_rng(7)
-    idx = pd.date_range("2020-01-01", periods=n, freq="B", tz="America/New_York")
+def test_candidate_prior_corr_prunes_family_but_keeps_full_count() -> None:
+    rng = np.random.default_rng(0)
+    n = 320
+    idx = pd.date_range("2021-01-01", periods=n, freq="B")
+    dcommon = rng.normal(0.0, 0.01, n)
 
-    def _pair(base_x: float, ar: float, noise: float, alpha: float, beta: float) -> tuple[np.ndarray, np.ndarray]:
-        log_x = np.cumsum(rng.normal(0.0002, 0.01, size=n)) + math.log(base_x)
-        spread = np.zeros(n)
-        for i in range(1, n):
-            spread[i] = ar * spread[i - 1] + rng.normal(0.0, noise)
-        log_y = alpha + beta * log_x + spread
-        return np.exp(log_y), np.exp(log_x)
+    def px(weight_common: float) -> np.ndarray:
+        r = weight_common * dcommon + rng.normal(0.0, 0.002, n)
+        return 100.0 * np.exp(np.cumsum(r))
 
-    aaa, bbb = _pair(100.0, ar=0.50, noise=0.008, alpha=0.15, beta=0.92)  # strong, fast reversion
-    ccc, ddd = _pair(80.0, ar=0.80, noise=0.018, alpha=0.10, beta=0.95)  # weaker, slower reversion
-    return pd.DataFrame({"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd}, index=idx)
+    # A,B load on a shared trend (highly return-correlated); C,D independent.
+    prices = pd.DataFrame({"A": px(1.0), "B": px(1.0), "C": px(0.0), "D": px(0.0)}, index=idx)
+    base = scan_cointegrated_pairs_with_report(prices, PairSelectionConfig(min_obs=100, candidate_prior="none"))
+    pruned = scan_cointegrated_pairs_with_report(
+        prices, PairSelectionConfig(min_obs=100, candidate_prior="corr", prior_min_abs_corr=0.6)
+    )
+    assert base.n_prior_admitted == 6 and base.n_symbol_pairs == 6  # full family tested
+    assert 1 <= pruned.n_prior_admitted < 6  # prior dropped the uncorrelated pairs
+    assert pruned.n_symbol_pairs == 6  # full family still recorded for multiplicity
 
 
-def _many_cointegrated_prices(n: int = 650) -> pd.DataFrame:
-    rng = np.random.default_rng(11)
-    idx = pd.date_range("2020-01-01", periods=n, freq="B", tz="America/New_York")
-    common = np.cumsum(rng.normal(0.0002, 0.01, size=n)) + math.log(100.0)
-    data = {}
-    for i, name in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"]):
-        spread = np.zeros(n)
-        for t in range(1, n):
-            spread[t] = 0.55 * spread[t - 1] + rng.normal(0.0, 0.004 + i * 0.001)
-        data[name] = np.exp(0.03 * i + (0.90 + 0.01 * i) * common + spread)
-    return pd.DataFrame(data, index=idx)
+def test_candidate_prior_config_validation() -> None:
+    with pytest.raises(ValueError):
+        PairSelectionConfig(candidate_prior="bogus")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        PairSelectionConfig(prior_min_abs_corr=1.5)
+
+
+def test_residualize_cross_sectional_removes_market_and_stays_positive() -> None:
+    from src.arbitrage.pairs import residualize_cross_sectional
+
+    rng = np.random.default_rng(1)
+    n = 200
+    idx = pd.date_range("2022-01-01", periods=n, freq="B")
+    mkt = rng.normal(0.0, 0.01, n)
+    prices = pd.DataFrame(
+        {s: 100.0 * np.exp(np.cumsum(mkt + rng.normal(0.0, 0.003, n))) for s in ["A", "B", "C", "D"]},
+        index=idx,
+    )
+    resid = residualize_cross_sectional(prices)
+    assert (resid.dropna() > 0).all().all()  # positive 'price' levels
+    rr = np.log(resid).diff().dropna()
+    assert abs(rr.mean(axis=1)).max() < 1e-9  # equal-weight market removed each bar
+
+
+# ---------------------------------------------------------------------------
+# construction_mode: shrunk_candidates (ported from main, plan 007)
+# ---------------------------------------------------------------------------
 
 
 def _strong_pair_with_noise_prices(n: int = 650) -> pd.DataFrame:
     rng = np.random.default_rng(1)
     idx = pd.date_range("2020-01-01", periods=n, freq="B", tz="America/New_York")
-
     log_x = np.cumsum(rng.normal(0.0002, 0.01, size=n)) + math.log(100.0)
     spread = np.zeros(n)
     for i in range(1, n):
         spread[i] = 0.45 * spread[i - 1] + rng.normal(0.0, 0.006)
     log_y = 0.15 + 0.92 * log_x + spread
-
     noise_one = np.cumsum(rng.normal(0.0001, 0.012, size=n)) + math.log(50.0)
     noise_two = np.cumsum(rng.normal(-0.00005, 0.013, size=n)) + math.log(60.0)
     return pd.DataFrame(
@@ -354,6 +372,162 @@ def test_fdr_hard_assigns_unit_evidence_weight() -> None:
     assert all(p.evidence_weight == 1.0 for p in pairs)
 
 
+def test_shrunk_candidates_noise_control_expands_trials_and_deflates_dsr() -> None:
+    prices = _strong_pair_with_noise_prices()
+    common = dict(
+        signal_config=PairSignalConfig(z_window=20, min_z_obs=10, entry_z=1.0, exit_z=0.2, stop_z=5.0),
+        walk_config=StatArbWalkForwardConfig(formation_bars=520, test_bars=60, min_test_bars=20),
+        execution=ExecutionConfig(spread_bps=0, commission_bps=0, slippage_coeff=0, borrow_rate_bps_annual=0),
+    )
+    hard_cfg = PairSelectionConfig(
+        min_obs=500,
+        max_pairs=6,
+        fdr_alpha=0.10,
+        max_coint_pvalue=0.99,
+        min_abs_return_corr=0.0,
+        max_half_life=1_000.0,
+        max_beta_drift=1_000.0,
+    )
+    shrunk_cfg = replace(hard_cfg, construction_mode="shrunk_candidates")
+
+    hard = run_stat_arb_walk_forward(prices, _open_from_close(prices), selection_config=hard_cfg, **common)
+    shrunk = run_stat_arb_walk_forward(prices, _open_from_close(prices), selection_config=shrunk_cfg, **common)
+
+    hard_noise = [p for f in hard.folds for p in f.selected_pairs if set(p.symbols) == {"NOI", "NSY"}]
+    shrunk_noise = [p for f in shrunk.folds for p in f.selected_pairs if set(p.symbols) == {"NOI", "NSY"}]
+
+    # The wider net admits the spurious noise pair (at sub-unit weight) the hard gate rejects,
+    # and must pay for it in the DSR ledger: more trials, lower deflated Sharpe.
+    assert not hard_noise
+    assert shrunk_noise
+    assert max(p.evidence_weight for p in shrunk_noise) < 0.25
+    assert shrunk.summary["pair_trial_count"] > hard.summary["pair_trial_count"]
+    assert shrunk.summary["pair_set_dsr"] < hard.summary["pair_set_dsr"]
+
+
+def test_candidate_prior_composes_with_shrunk_candidates() -> None:
+    # The two feature sets compose: candidate_prior prunes the family first, then
+    # shrunk_candidates admits-and-weights the survivors.
+    prices = _strong_pair_with_noise_prices()
+    report = scan_cointegrated_pairs_with_report(
+        prices,
+        PairSelectionConfig(
+            min_obs=500,
+            max_pairs=6,
+            fdr_alpha=0.10,
+            max_coint_pvalue=0.99,
+            min_abs_return_corr=0.0,
+            max_half_life=1_000.0,
+            max_beta_drift=1_000.0,
+            candidate_prior="corr",
+            prior_min_abs_corr=0.3,
+            construction_mode="shrunk_candidates",
+        ),
+    )
+    assert report.n_prior_admitted <= report.n_symbol_pairs
+    assert report.selected_candidates
+    weights = [c.evidence_weight for c in report.selected_candidates]
+    assert all(0.0 < w <= 1.0 for w in weights)
+    assert max(weights) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# residualize_pca: causal multi-factor residual prices (plan 008)
+# ---------------------------------------------------------------------------
+
+
+def _market_and_sector_panel(n: int = 400, seed: int = 3) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2021-01-01", periods=n, freq="B")
+    mkt = rng.normal(0.0003, 0.01, n)
+    sec_a = rng.normal(0.0, 0.008, n)
+    sec_b = rng.normal(0.0, 0.008, n)
+    cols: dict[str, np.ndarray] = {}
+    for i in range(4):  # sector A: market + sec_a + idiosyncratic
+        cols[f"A{i}"] = 100.0 * np.exp(np.cumsum(mkt + sec_a + rng.normal(0.0, 0.004, n)))
+    for i in range(4):  # sector B: market + sec_b + idiosyncratic
+        cols[f"B{i}"] = 100.0 * np.exp(np.cumsum(mkt + sec_b + rng.normal(0.0, 0.004, n)))
+    return pd.DataFrame(cols, index=idx)
+
+
+def _mean_abs_pairwise_corr(prices: pd.DataFrame) -> float:
+    rr = np.log(prices).diff().dropna(how="all")
+    corr = rr.corr().to_numpy()
+    off_diag = corr[~np.eye(corr.shape[0], dtype=bool)]
+    return float(np.nanmean(np.abs(off_diag)))
+
+
+def test_residualize_pca_positive_and_masked() -> None:
+    from src.arbitrage.pairs import residualize_pca
+
+    prices = _market_and_sector_panel()
+    prices.iloc[150:160, 0] = np.nan  # a post-warmup input gap
+    resid = residualize_pca(prices, n_factors=3, corr_window=60, rebalance_every=5)
+    assert (resid.dropna() > 0).all().all()  # positive 'price' levels where defined
+    assert resid.iloc[150:160, 0].isna().all()  # NaN where the input price is missing
+    assert resid.iloc[:60].isna().all().all()  # warmup carries no factor model
+
+
+def test_residualize_pca_removes_more_than_market_demean() -> None:
+    from src.arbitrage.pairs import residualize_cross_sectional, residualize_pca
+
+    prices = _market_and_sector_panel()
+    pca = residualize_pca(prices, n_factors=3, corr_window=60, rebalance_every=5)
+    xs = residualize_cross_sectional(prices)
+    # Multi-factor removes the sector co-movement the equal-weight market demean leaves.
+    assert _mean_abs_pairwise_corr(pca) < _mean_abs_pairwise_corr(xs)
+
+
+def test_residualize_pca_causal() -> None:
+    from src.arbitrage.pairs import residualize_pca
+
+    prices = _market_and_sector_panel()
+    full = residualize_pca(prices, n_factors=3, corr_window=60, rebalance_every=5)
+    truncated = residualize_pca(prices.iloc[:300], n_factors=3, corr_window=60, rebalance_every=5)
+    # Appending future bars must not change residual prices on earlier bars (no lookahead).
+    a = full.loc[truncated.index].to_numpy()
+    b = truncated.to_numpy()
+    both = np.isfinite(a) & np.isfinite(b)
+    assert both.any()
+    assert np.allclose(a[both], b[both])
+
+
+# ---------------------------------------------------------------------------
+# shrunk_candidates: portfolio weighting + max_pairs (from main, merge union)
+# ---------------------------------------------------------------------------
+
+
+def _two_cointegrated_pairs_prices(n: int = 650) -> pd.DataFrame:
+    """Two independent cointegrated pairs of differing strength, plus no cross-pair link."""
+    rng = np.random.default_rng(7)
+    idx = pd.date_range("2020-01-01", periods=n, freq="B", tz="America/New_York")
+
+    def _pair(base_x: float, ar: float, noise: float, alpha: float, beta: float) -> tuple[np.ndarray, np.ndarray]:
+        log_x = np.cumsum(rng.normal(0.0002, 0.01, size=n)) + math.log(base_x)
+        spread = np.zeros(n)
+        for i in range(1, n):
+            spread[i] = ar * spread[i - 1] + rng.normal(0.0, noise)
+        log_y = alpha + beta * log_x + spread
+        return np.exp(log_y), np.exp(log_x)
+
+    aaa, bbb = _pair(100.0, ar=0.50, noise=0.008, alpha=0.15, beta=0.92)  # strong, fast reversion
+    ccc, ddd = _pair(80.0, ar=0.80, noise=0.018, alpha=0.10, beta=0.95)  # weaker, slower reversion
+    return pd.DataFrame({"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd}, index=idx)
+
+
+def _many_cointegrated_prices(n: int = 650) -> pd.DataFrame:
+    rng = np.random.default_rng(11)
+    idx = pd.date_range("2020-01-01", periods=n, freq="B", tz="America/New_York")
+    common = np.cumsum(rng.normal(0.0002, 0.01, size=n)) + math.log(100.0)
+    data = {}
+    for i, name in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"]):
+        spread = np.zeros(n)
+        for t in range(1, n):
+            spread[t] = 0.55 * spread[t - 1] + rng.normal(0.0, 0.004 + i * 0.001)
+        data[name] = np.exp(0.03 * i + (0.90 + 0.01 * i) * common + spread)
+    return pd.DataFrame(data, index=idx)
+
+
 def test_shrunk_candidates_weight_by_strength_and_change_portfolio() -> None:
     prices = _two_cointegrated_pairs_prices()
     common = dict(
@@ -383,7 +557,6 @@ def test_shrunk_candidates_weight_by_strength_and_change_portfolio() -> None:
 
     # The selection ledger carries the weight for claim-packet discipline.
     assert "evidence_weight" in fold_result_to_dict(shrunk.folds[0])["selected_pairs"][0]
-
     # Wider-or-equal search family -> at least as many DSR trials as the hard gate.
     assert shrunk.summary["pair_trial_count"] >= hard.summary["pair_trial_count"]
 
@@ -393,37 +566,6 @@ def test_shrunk_candidates_weight_by_strength_and_change_portfolio() -> None:
         hard.portfolio.target_weights.loc[common_idx].to_numpy(),
         shrunk.portfolio.target_weights.loc[common_idx].to_numpy(),
     )
-
-
-def test_shrunk_candidates_noise_control_expands_trials_and_deflates_dsr() -> None:
-    prices = _strong_pair_with_noise_prices()
-    common = dict(
-        signal_config=PairSignalConfig(z_window=20, min_z_obs=10, entry_z=1.0, exit_z=0.2, stop_z=5.0),
-        walk_config=StatArbWalkForwardConfig(formation_bars=520, test_bars=60, min_test_bars=20),
-        execution=ExecutionConfig(spread_bps=0, commission_bps=0, slippage_coeff=0, borrow_rate_bps_annual=0),
-    )
-    hard_cfg = PairSelectionConfig(
-        min_obs=500,
-        max_pairs=6,
-        fdr_alpha=0.10,
-        max_coint_pvalue=0.99,
-        min_abs_return_corr=0.0,
-        max_half_life=1_000.0,
-        max_beta_drift=1_000.0,
-    )
-    shrunk_cfg = replace(hard_cfg, construction_mode="shrunk_candidates")
-
-    hard = run_stat_arb_walk_forward(prices, _open_from_close(prices), selection_config=hard_cfg, **common)
-    shrunk = run_stat_arb_walk_forward(prices, _open_from_close(prices), selection_config=shrunk_cfg, **common)
-
-    hard_noise = [p for f in hard.folds for p in f.selected_pairs if set(p.symbols) == {"NOI", "NSY"}]
-    shrunk_noise = [p for f in shrunk.folds for p in f.selected_pairs if set(p.symbols) == {"NOI", "NSY"}]
-
-    assert not hard_noise
-    assert shrunk_noise
-    assert max(p.evidence_weight for p in shrunk_noise) < 0.25
-    assert shrunk.summary["pair_trial_count"] > hard.summary["pair_trial_count"]
-    assert shrunk.summary["pair_set_dsr"] < hard.summary["pair_set_dsr"]
 
 
 def test_shrunk_candidates_honors_max_pairs_and_counts_omissions() -> None:

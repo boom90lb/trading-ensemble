@@ -49,7 +49,6 @@ from scripts.backtest import load_fold_ensemble, run_symbol_wfo
 from scripts.training import (
     build_features,
     parse_model_names,
-    reject_sentiment_flag,
     train_symbol_wfo,
 )
 from src.config import (
@@ -58,6 +57,7 @@ from src.config import (
     ModelConfig,
     TrainingConfig,
 )
+from src.features import forward_return_column
 from src.data_loader import DataLoader
 from src.features import FeatureEngineer
 from src.tracking.mlflow_utils import (
@@ -311,7 +311,7 @@ def run_sweep(
     """
     trials_spec = expand_grid(grid)
     horizon = args.horizon
-    target_col = f"target_{horizon}"
+    target_col = forward_return_column(horizon)
 
     model_names = parse_model_names(args.models)
     model_configs = [
@@ -477,7 +477,7 @@ def prepare_sweep_data(args) -> Dict[str, pd.DataFrame]:
     training_config = TrainingConfig(
         symbols=symbols, timeframe=args.timeframe,
         start_date=args.start_date, end_date=args.end_date,
-        prediction_horizon=args.horizon, use_sentiment=args.use_sentiment,
+        prediction_horizon=args.horizon, use_sentiment=False,
         n_splits=args.n_splits, embargo_pct=args.embargo_pct,
         expanding=not args.rolling,
     )
@@ -507,7 +507,6 @@ def parse_args():
                    default=DEFAULT_TRAINING_CONFIG.start_date)
     p.add_argument("--end_date", type=str, default=None)
     p.add_argument("--horizon", type=int, default=5)
-    p.add_argument("--use_sentiment", action="store_true")
     p.add_argument(
         "--models", type=str, default="xgboost",
         help="Forecast-only members. RL members make the grid infeasible.",
@@ -543,7 +542,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    reject_sentiment_flag(args.use_sentiment, surface="sweep")
     parse_model_names(args.models)
     grid = DEFAULT_GRID
     if args.grid_json:

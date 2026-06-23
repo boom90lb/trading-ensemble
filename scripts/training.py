@@ -41,7 +41,7 @@ from src.config import (
     TrainingConfig,
 )
 from src.data_loader import DataLoader, _tz_aware_filter
-from src.features import FeatureEngineer
+from src.features import FeatureEngineer, forward_return_column, is_label_column
 from src.models.ensemble import EnsembleModel
 from src.sentiment_analysis import SentimentAnalyzer
 from src.logging_utils import configure_logging, get_symbol_logger
@@ -68,7 +68,7 @@ except AttributeError:
 logger = logging.getLogger(__name__)
 
 R0_QUARANTINED_MODELS = frozenset({"lstm"})
-DEFAULT_MODEL_SELECTION = "arima,prophet,xgboost,lstm_ppo,xlstm_ppo,xlstm_grpo"
+DEFAULT_MODEL_SELECTION = "xgboost,lstm_ppo,xlstm_ppo,xlstm_grpo"
 FOLD_METADATA_SCHEMA_VERSION = 2
 
 
@@ -202,23 +202,17 @@ def parse_args():
                         help="End date in YYYY-MM-DD format")
     parser.add_argument("--horizon", type=int, default=5,
                         help="Forecast horizon (bars)")
-    parser.add_argument("--use_sentiment", action="store_true",
-                        help="Use sentiment analysis features")
     parser.add_argument(
         "--models", type=str,
         default=DEFAULT_MODEL_SELECTION,
         help="Comma-separated list of ensemble member names",
     )
-    parser.add_argument("--optimize", action="store_true",
-                        help="Run hyperparameter optimization")
     parser.add_argument("--rl_timesteps", type=int, default=100000,
                         help="Total timesteps for each PPO member's training")
     parser.add_argument("--gpu", action="store_true",
                         help="Enable GPU acceleration if available")
     parser.add_argument("--checkpoint_freq", type=int, default=50000,
                         help="Checkpoint frequency for RL training")
-    parser.add_argument("--extended_features", action="store_true",
-                        help="Use extended feature set")
 
     # WFO knobs
     parser.add_argument("--n_splits", type=int, default=DEFAULT_TRAINING_CONFIG.n_splits,
@@ -303,8 +297,11 @@ def clean_data_for_training(df: pd.DataFrame) -> pd.DataFrame:
 
     * Inf -> NaN (row-wise, causal).
     * Drop columns with >30% NaN (column-set decision; barely informative).
-    * Forward-fill remaining NaNs (past -> future, causal).
-    * Final fill-with-0 to handle warmup-period leading NaNs.
+    * Forward-fill remaining feature NaNs (past -> future, causal).
+    * Final feature fill-with-0 to handle warmup-period leading NaNs.
+
+    Label columns keep their NaNs: the final ``horizon`` rows have no observed
+    forward outcome and must be excluded by the downstream ``dropna(target)``.
 
     Outlier clipping is intentionally NOT done here — that lives in
     ``FeatureEngineer.transform_features`` which uses train-only bounds
@@ -317,12 +314,18 @@ def clean_data_for_training(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.index, pd.DatetimeIndex):
         assert df.index.tz is not None, "training frame index lost its timezone"
     result = df.replace([np.inf, -np.inf], np.nan)
-    nan_pct = result.isna().mean()
+    label_cols = [col for col in result.columns if is_label_column(col)]
+    labels = result[label_cols].copy()
+    feature_cols = [col for col in result.columns if col not in label_cols]
+
+    nan_pct = result[feature_cols].isna().mean()
     high_nan_cols = nan_pct[nan_pct > 0.3].index.tolist()
     if high_nan_cols:
         logger.warning(f"Dropping {len(high_nan_cols)} cols with >30% NaN")
         result = result.drop(columns=high_nan_cols)
     result = result.ffill().fillna(0)
+    for col in label_cols:
+        result[col] = labels[col]
     return result
 
 
@@ -468,7 +471,7 @@ def train_symbol_wfo(
     usable = full_df.dropna(subset=[target_col]).copy()
     feature_cols = [
         c for c in usable.columns
-        if "target_" not in c and "direction_" not in c
+        if not is_label_column(c)
     ]
 
     log_params_safe({
@@ -503,12 +506,12 @@ def train_symbol_wfo(
 
         X_train = train_scaled.drop(
             columns=[c for c in train_scaled.columns
-                     if "target_" in c or "direction_" in c]
+                     if is_label_column(c)]
         )
         y_train = train_scaled[target_col]
         X_test = test_scaled.drop(
             columns=[c for c in test_scaled.columns
-                     if "target_" in c or "direction_" in c]
+                     if is_label_column(c)]
         )
         y_test = test_scaled[target_col]
         # Defensive: re-align if scalers dropped any columns on test.
@@ -648,7 +651,6 @@ def filter_universe_asof(
 def main():
     """Main function."""
     args = parse_args()
-    reject_sentiment_flag(args.use_sentiment, surface="training")
     model_names = parse_model_names(args.models)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     configure_logging(verbose=args.verbose, run_name="training")
@@ -680,8 +682,7 @@ def main():
         start_date=args.start_date,
         end_date=args.end_date,
         prediction_horizon=args.horizon,
-        use_sentiment=args.use_sentiment,
-        optimize=args.optimize,
+        use_sentiment=False,
         n_splits=args.n_splits,
         purge_horizon=args.purge_horizon,
         embargo_pct=args.embargo_pct,
@@ -728,7 +729,7 @@ def main():
         expanding=training_config.expanding,
     )
 
-    target_col = f"target_{training_config.prediction_horizon}"
+    target_col = forward_return_column(training_config.prediction_horizon)
 
     with mlflow.start_run(
         experiment_id=experiment_id, run_name=f"training_{timestamp}",
@@ -739,7 +740,7 @@ def main():
             "start_date": args.start_date,
             "end_date": args.end_date,
             "horizon": args.horizon,
-            "use_sentiment": args.use_sentiment,
+            "use_sentiment": False,
             "models": ",".join(model_names),
             "n_splits": training_config.n_splits,
             "purge_horizon": training_config.effective_purge_horizon,
